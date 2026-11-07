@@ -1,0 +1,12 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder check (diperluas saat kode masuk — VC-011+/VC-016+/VC-020+/VC-024+/OPS-112)
+        run: test -f README.md
