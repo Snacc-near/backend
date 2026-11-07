@@ -1,0 +1,17 @@
+{
+  "name": "snacc-backend",
+  "version": "0.1.0",
+  "description": "M5 indexer-api: NEP-297 event poller + /api/crucible/* (scaffold INT-101..108)",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/",
+    "start": "node dist/src/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
