@@ -1,0 +1,19 @@
+# Snacc ($SNACC)
+
+> NFTs that eat a memecoin. Feed your Snacc or it gets snacked.
+
+On-chain economy game on NEAR (hackathon build 1-14 Nov 2026, testnet only). Every NFT
+(Homunculus Strain, NEP-171/177) is a living balance-sheet organism with its own keyless
+sub-account (s-<id>.snacc-v001.near) that must eat the $SNACC memecoin or starves (BMR decay).
+3-stage NEP-245 supply chain, vertical mergers (splice_strains), hostile takeover of distressed
+strains, public liquidation harvest (harvest_starving_strain, 10% bounty / 90% treasury).
+Algorithmic central bank CrucibleTemp: burn 3.5% of fees in Fever, subsidize 2% in Hypothermia
+(capped 5%/epoch), no admin withdrawal. Secret AI recipes evaluated in NEAR AI Cloud TEE
+(z-ai/glm-5.3-flash), verified on-chain via env::sha256 + env::ed25519_verify - no trusted oracle.
+
+- Product overview: https://github.com/Snacc-near/snacc/blob/main/docs/partner-onboarding.md
+- Working rules: https://github.com/Snacc-near/snacc/blob/main/CLAUDE.md
+- Repos: https://github.com/Snacc-near/{snacc,contracts,oracle-tee,sdk,backend,frontend,scripts}
+
+Honesty: no live mainnet claims (testnet-only evidence); $SNACC testnet tokens have no monetary
+value; volatility is a feature, not a promise; no guaranteed returns.
