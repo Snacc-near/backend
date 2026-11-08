@@ -57,17 +57,27 @@ test("route: macro 503 saat kontrak belum deploy", async () => {
   assert.deepEqual(res.body, { error: "contract_not_deployed" });
 });
 
-test("route: /api/strains dari event store + flag indexer_incomplete", async () => {
-  const store = newStore();
+test("route: /api/strains kosong bila supply NFT 0 (dari view, bukan event store)", async () => {
   const res = await route(fakeReq("/api/strains"), {
-    rpc: clientWithResult({}),
+    rpc: clientWithResult("0"),
     contractId: "c.near",
-    store,
+    store: newStore(),
   });
   assert.equal(res.status, 200);
-  const body = res.body as { strains: unknown[]; indexer_incomplete: boolean };
+  const body = res.body as { strains: unknown[]; indexer_incomplete: boolean; source: string };
   assert.deepEqual(body.strains, []);
-  assert.equal(body.indexer_incomplete, true);
+  assert.equal(body.indexer_incomplete, false);
+  assert.equal(body.source, "view:nft_total_supply+get_strain");
+});
+
+test("route: /api/events tetap menandai indexer_incomplete", async () => {
+  const res = await route(fakeReq("/api/events"), {
+    rpc: clientWithResult({}),
+    contractId: "c.near",
+    store: newStore(),
+  });
+  assert.equal(res.status, 200);
+  assert.equal((res.body as { indexer_incomplete: boolean }).indexer_incomplete, true);
 });
 
 test("route: /api/strains/:id 404 strain_not_found", async () => {
@@ -81,7 +91,7 @@ test("route: /api/strains/:id 404 strain_not_found", async () => {
 });
 
 test("route: stub endpoint -> 501 dengan ID backlog", async () => {
-  for (const p of ["/api/strains/1/svg", "/api/colony/a.near", "/api/dividends", "/api/zones", "/api/appetite", "/api/tee/evaluate-genome"]) {
+  for (const p of ["/api/tee/evaluate-genome"]) {
     const res = await route(fakeReq(p), {
       rpc: clientWithResult({}),
       contractId: "c.near",

@@ -41,23 +41,53 @@ export class RpcError extends Error {
   }
 }
 
+const RETRY_ATTEMPTS = 3;
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+
+/** View method panik di kontrak: RPC membalas `result.error` (bukan `error`) tanpa `result.result`. */
+export class ViewPanicError extends Error {
+  constructor(
+    public readonly method: string,
+    public readonly detail: string,
+  ) {
+    super(`view ${method} panik: ${detail}`);
+    this.name = "ViewPanicError";
+  }
+}
+
+/**
+ * u128 di view kontrak keluar sebagai literal angka tanpa tanda kutip (mis. `"atp_balance":575782630`);
+ * `JSON.parse` memotongnya ke float64. Bungkus field u128 bernama dengan tanda kutip SEBELUM parse
+ * supaya presisi utuh (prinsip "u128 = string presisi"). Hanya mengubah `"key": <digit>`.
+ */
+export function quoteU128Fields(text: string, keys: readonly string[]): string {
+  let out = text;
+  for (const key of keys) {
+    out = out.replace(new RegExp(`("${key}"\\s*:\\s*)(\\d+)(?![\\d.eE])`, "g"), '$1"$2"');
+  }
+  return out;
+}
+
 export class NearRpcClient {
   constructor(
     private readonly rpcUrl: string,
     private readonly fetchFn: typeof fetch = fetch,
+    /** Jeda dasar retry (ms) untuk HTTP 429/502/503/504 dari RPC publik; 0 = tanpa jeda (test). */
+    private readonly retryDelayMs: number = 400,
   ) {}
 
   async fetchJsonRpc<T>(method: string, params: unknown): Promise<T> {
-    const res = await this.fetchFn(this.rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "snacc-backend",
-        method,
-        params,
-      }),
-    });
+    const payload = JSON.stringify({ jsonrpc: "2.0", id: "snacc-backend", method, params });
+    let res!: Response;
+    for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+      res = await this.fetchFn(this.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      });
+      if (!RETRYABLE_STATUS.has(res.status) || attempt === RETRY_ATTEMPTS) break;
+      await new Promise((ok) => setTimeout(ok, this.retryDelayMs * 2 ** attempt));
+    }
     if (!res.ok) {
       throw new RpcError({
         code: -32000,
@@ -86,13 +116,16 @@ export class NearRpcClient {
     methodName: string,
     argsBase64: string,
   ): Promise<{ text: string; logs: string[]; block_height: number }> {
-    const r = await this.fetchJsonRpc<CallFunctionResult>("query", {
+    const r = await this.fetchJsonRpc<CallFunctionResult & { error?: string }>("query", {
       request_type: "call_function",
       finality: "final",
       account_id: contractId,
       method_name: methodName,
       args_base64: argsBase64,
     });
+    if (!Array.isArray(r.result)) {
+      throw new ViewPanicError(methodName, String(r.error ?? "respons view tanpa result"));
+    }
     const text = Buffer.from(r.result).toString("utf8");
     return { text, logs: r.logs, block_height: r.block_height };
   }
