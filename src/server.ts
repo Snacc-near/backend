@@ -1,7 +1,8 @@
 /**
  * Router HTTP /api/* (INT-101..103, VC-020, INT-105..106, VC-015). Node murni, tanpa framework.
  * Semua data dari view kontrak / enclave NEAR AI Cloud; endpoint yang sumber datanya belum ada
- * merespons 501 + ID backlog — tidak pernah mengarang data.
+ * merespons 501 + ID backlog — tidak pernah mengarang data. `POST /api/tee/evaluate-genome` (VC-015)
+ * dipagari kunci server + tanda tangan NEP-413 pemilik strain + rate limit (lihat evaluate.ts).
  */
 
 import { IncomingMessage } from "node:http";
@@ -18,6 +19,7 @@ import {
   isValidAccountId,
 } from "./views.js";
 import { fetchAttestation, type FetchLike } from "./tee.js";
+import { MAX_BODY_BYTES, evaluateGenome, type EvaluateDeps } from "./evaluate.js";
 
 export interface RouterDeps {
   rpc: NearRpcClient;
@@ -25,6 +27,8 @@ export interface RouterDeps {
   store: EventStore;
   /** Injeksi untuk test; default `fetch` global. Dipakai route `/api/tee/attestation-report`. */
   fetchFn?: FetchLike;
+  /** Pagar `POST /api/tee/evaluate-genome` (VC-015); tanpa ini endpoint 503 `tee_not_configured`. */
+  evaluate?: EvaluateDeps;
 }
 
 export interface RouterResult {
@@ -34,13 +38,21 @@ export interface RouterResult {
   headers?: Record<string, string>;
 }
 
-const STUBS: Record<string, string> = {
-  "/api/tee/evaluate-genome":
-    "VC-015 (evaluate-genome): butuh NEAR_AI_API_KEY di server + pipeline oracle-tee (redaksi Layer 1 + request body baku) yang belum dikemas sebagai dependensi backend; backend publik sengaja tanpa kunci. Bukti alur nyata: evidence/tee-vector-live.json (scripts/tee-live-vector.mjs)",
-};
-
-function matchStub(pathname: string): string | undefined {
-  return STUBS[pathname];
+/** Baca body JSON ≤ `max` byte dari stream request; `null` bila terlalu besar, `undefined` bila bukan JSON. */
+async function readJsonBody(req: IncomingMessage, max: number): Promise<unknown | null | undefined> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
+    size += buf.length;
+    if (size > max) return null;
+    chunks.push(buf);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return undefined;
+  }
 }
 
 /** Hasil view `{error}` -> status HTTP. */
@@ -173,9 +185,16 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
     };
   }
 
-  const stubTodo = matchStub(pathname);
-  if (stubTodo) {
-    return { status: 501, body: { error: "not_implemented", todo: stubTodo } };
+  if (pathname === "/api/tee/evaluate-genome") {
+    if (req.method !== "POST") {
+      return { status: 405, body: { error: "method_not_allowed" }, headers: { Allow: "POST" } };
+    }
+    // Tanpa kunci server: tolak dulu, sebelum membaca body atau memanggil RPC.
+    if (!deps.evaluate?.apiKey) return { status: 503, body: { error: "tee_not_configured" } };
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    if (body === null) return { status: 413, body: { error: "body_too_large", maxBytes: MAX_BODY_BYTES } };
+    if (body === undefined) return { status: 400, body: { error: "invalid_json" } };
+    return evaluateGenome(body, rpc, contractId, deps.evaluate);
   }
 
   return { status: 404, body: { error: "not_found", path: pathname } };

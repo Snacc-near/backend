@@ -1,5 +1,5 @@
 /**
- * Bootstrap server (INT-101). Env: PORT, CONTRACT_ID, RPC_URL, POLL_INTERVAL_MS.
+ * Bootstrap server (INT-101). Env: PORT, CONTRACT_ID, RPC_URL, POLL_INTERVAL_MS, NEAR_AI_API_KEY (opsional, VC-015).
  * Tanpa env -> default testnet + kontrak kamus snacc-v001.testnet.
  */
 
@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { NearRpcClient } from "./near.js";
 import { route, newStore } from "./server.js";
 import { collectEventsFromChunk, absorbEvent } from "./events.js";
+import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
 const CONTRACT_ID = process.env["CONTRACT_ID"] ?? "snacc-v001.testnet";
@@ -15,9 +16,11 @@ const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 15000);
 
 const rpc = new NearRpcClient(RPC_URL);
 const store = newStore();
+// VC-015: kunci NEAR AI hanya dari env server; tidak pernah dicatat/dikembalikan. Kosong -> 503 tee_not_configured.
+const evaluateDeps: EvaluateDeps = { apiKey: process.env["NEAR_AI_API_KEY"] || undefined, ...newEvaluateState() };
 
 const server = createServer((req, res) => {
-  route(req, { rpc, contractId: CONTRACT_ID, store })
+  route(req, { rpc, contractId: CONTRACT_ID, store, evaluate: evaluateDeps })
     .then((r) => {
       res.writeHead(r.status, {
         "Content-Type": r.contentType ?? "application/json",
