@@ -51,10 +51,20 @@ Penanda tangan memakai `recipient: "snacc-backend"` dan tanpa `callbackUrl`. Sya
 ```jsonc
 // 200
 { "chatId", "signedText", "signatureHex", "signingAddress",
+  "raw_response_body",               // string: byte respons enclave utuh (untuk apply)
   "mutation": { "efficiency_shift_bps", "vitality_bonus", "phenotype_trait" },
   "redactionReport": { "redaction_mode", "classification", "warnings", "commitment_hex", "salt_hex",
                        "request_sha256_hex", "payload_terredaksi", "signature_verified" } }
 ```
+
+**Langkah lanjutan commit → apply on-chain** (dilakukan klien/FE dengan dompet pemilik; backend tidak pernah menandatangani transaksi). Hash request baru diketahui sesudah panggilan ini (salt acak server), sehingga `commit` dilakukan sesudahnya:
+
+1. `signer` enclave (`signingAddress`, hex 32 byte) harus sudah terdaftar di kontrak lewat `register_attested_signer` (khusus owner kontrak) — satu kali.
+2. `commit_genome_experiment({ strain_id, req_sha256_hex: redactionReport.request_sha256_hex })`.
+3. `apply_tee_mutation_zero_trust({ strain_id, req_sha256_hex: redactionReport.request_sha256_hex, raw_response_body, signature_hex: signatureHex, tee_pubkey_hex: signingAddress })`. `raw_response_body` harus dikirim **tanpa diubah satu byte pun** (kontrak menghitung ulang sha256-nya dan mencocokkan dengan `signedText`); `chatId` dipakai sekali (anti-replay).
+4. Kontrak menolak bila `strain_id` di payload mutasi ≠ `strain_id` transaksi — gunakan `strain_id` yang sama dengan request evaluate.
+
+Catatan jujur: urutan ADR-21 fase 1 ("commit sebelum memanggil enclave") tidak tercapai di jalur ini; commit hanya mengikat hash yang sudah dihitung.
 
 Galat: `400 invalid_request|invalid_json|invalid_account_id` · `401 auth_required|invalid_message|signature_expired|invalid_nonce|nonce_reused|invalid_signature` · `403 public_key_not_owned|public_key_not_full_access|not_strain_owner` · `404 strain_not_found` · `405` (bukan POST) · `413 body_too_large` · `429 rate_limited` (+ header `Retry-After`; **3/jam per strain**, **50/hari total**, in-memory) · `502 tee_upstream_failed|tee_guardrail_rejected` · `503 tee_not_configured|rpc_unavailable|contract_not_deployed`.
 
