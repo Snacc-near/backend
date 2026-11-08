@@ -59,7 +59,7 @@ test("fetchMacroState memetakan field sesuai spec", async () => {
   assert.ok(!("error" in m));
   assert.equal(m.zone, "Fever"); // 1120 mK > 610 (threshold ECON-111) = Fever
   assert.equal(m.crucibleTemp, 1120);
-  assert.equal(m.totalVitaSupply, "1000000");
+  assert.equal(m.totalSnaccSupply, "1000000");
   assert.equal(m.ruleBoundTreasury, "200000");
   assert.equal(m.blockHeight, 777);
 });

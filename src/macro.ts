@@ -4,13 +4,13 @@
  * Tidak ada nilai default yang dikarang: field RPC diteruskan apa adanya.
  */
 
-import { NearRpcClient, isContractNotDeployed } from "./near.js";
+import { NearRpcClient, ViewPanicError, isContractNotDeployed, quoteU128Fields } from "./near.js";
 
 export interface CrucibleMacroResponse {
   crucibleTemp: number;
   zone: "Fever" | "Goldilocks" | "Hypothermia";
-  totalVitaSupply: string;
-  totalVitaBurned: string;
+  totalSnaccSupply: string;
+  totalSnaccBurned: string;
   ruleBoundTreasury: string;
   epochVolume: string;
   history: unknown[];
@@ -35,6 +35,12 @@ export interface StrainVesselView {
   status: string;
   effective_vitality: number;
 }
+
+/**
+ * Field u128/u64 besar di `StrainVesselView` (literal angka di RPC -> string presisi).
+ * `last_allocate_epoch` memakai sentinel u64::MAX (18446744073709551615) yang tak muat float64.
+ */
+export const STRAIN_U128_FIELDS = ["atp_balance", "last_allocate_epoch"] as const;
 
 export function zoneOf(crucibleTemp: number): "Fever" | "Goldilocks" | "Hypothermia" {
   // `ECON-111` (2026-11-08): FEVER 1400 -> 610 mK (supersede; 1400 tak terjangkau -> burn mati).
@@ -69,8 +75,8 @@ export async function fetchMacroState(
   return {
     crucibleTemp: temp,
     zone: zoneOf(temp),
-    totalVitaSupply: u128From(text, "total_snacc_supply"),
-    totalVitaBurned: u128From(text, "total_snacc_burned"),
+    totalSnaccSupply: u128From(text, "total_snacc_supply"),
+    totalSnaccBurned: u128From(text, "total_snacc_burned"),
     ruleBoundTreasury: u128From(text, "epoch_treasury_initial"),
     epochVolume: u128From(text, "volume_epoch"),
     history: [],
@@ -91,8 +97,10 @@ export async function fetchStrain(
     text = r.text;
   } catch (err) {
     if (isContractNotDeployed(err)) return { error: "contract_not_deployed" };
+    // `get_strain` hanya panik lewat ERR_STRAIN_NOT_FOUND (RPC melapor WasmTrap tanpa pesan).
+    if (err instanceof ViewPanicError) return { error: "strain_not_found" };
     throw err;
   }
   if (!text || text === "null") return { error: "strain_not_found" };
-  return JSON.parse(text) as StrainVesselView;
+  return JSON.parse(quoteU128Fields(text, STRAIN_U128_FIELDS)) as StrainVesselView;
 }

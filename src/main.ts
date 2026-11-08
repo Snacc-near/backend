@@ -10,7 +10,7 @@ import { collectEventsFromChunk, absorbEvent } from "./events.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
 const CONTRACT_ID = process.env["CONTRACT_ID"] ?? "snacc-v001.testnet";
-const RPC_URL = process.env["RPC_URL"] ?? "https://rpc.testnet.near.org";
+const RPC_URL = process.env["RPC_URL"] ?? "https://test.rpc.fastnear.com"; // rpc.testnet.near.org deprecated (HTTP 429)
 const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 15000);
 
 const rpc = new NearRpcClient(RPC_URL);
@@ -19,7 +19,10 @@ const store = newStore();
 const server = createServer((req, res) => {
   route(req, { rpc, contractId: CONTRACT_ID, store })
     .then((r) => {
-      res.writeHead(r.status, { "Content-Type": r.contentType ?? "application/json" });
+      res.writeHead(r.status, {
+        "Content-Type": r.contentType ?? "application/json",
+        ...r.headers,
+      });
       res.end(r.contentType ? r.body : JSON.stringify(r.body));
     })
     .catch((err: unknown) => {
