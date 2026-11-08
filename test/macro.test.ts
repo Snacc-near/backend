@@ -47,17 +47,17 @@ function clientWithRpcError(data: string): NearRpcClient {
   return new NearRpcClient("http://rpc.test", fetchFn);
 }
 
-test("zoneOf: batas 600/1400 (Kamus Angka)", () => {
+test("zoneOf: batas 600/610 (ECON-111 supersede 1400)", () => {
   assert.equal(zoneOf(599), "Hypothermia");
   assert.equal(zoneOf(600), "Goldilocks");
-  assert.equal(zoneOf(1400), "Goldilocks");
-  assert.equal(zoneOf(1401), "Fever");
+  assert.equal(zoneOf(610), "Goldilocks");
+  assert.equal(zoneOf(611), "Fever");
 });
 
 test("fetchMacroState memetakan field sesuai spec", async () => {
   const m = await fetchMacroState(clientWithResult(MACRO_STATE), "snacc-v001.testnet");
   assert.ok(!("error" in m));
-  assert.equal(m.zone, "Goldilocks");
+  assert.equal(m.zone, "Fever"); // 1120 mK > 610 (threshold ECON-111) = Fever
   assert.equal(m.crucibleTemp, 1120);
   assert.equal(m.totalVitaSupply, "1000000");
   assert.equal(m.ruleBoundTreasury, "200000");

@@ -37,9 +37,16 @@ export interface StrainVesselView {
 }
 
 export function zoneOf(crucibleTemp: number): "Fever" | "Goldilocks" | "Hypothermia" {
-  if (crucibleTemp > 1400) return "Fever";
+  // `ECON-111` (2026-11-08): FEVER 1400 -> 610 mK (supersede; 1400 tak terjangkau -> burn mati).
+  if (crucibleTemp > 610) return "Fever";
   if (crucibleTemp < 600) return "Hypothermia";
   return "Goldilocks";
+}
+
+/** u128 dari teks JSON mentah — JANGAN lewat `JSON.parse` (float64 -> notasi e, presisi hilang). */
+function u128From(text: string, key: string): string {
+  const m = text.match(new RegExp(`"${key}":\\s*"?(\\d+)`));
+  return m?.[1] ?? "0";
 }
 
 export async function fetchMacroState(
@@ -62,10 +69,10 @@ export async function fetchMacroState(
   return {
     crucibleTemp: temp,
     zone: zoneOf(temp),
-    totalVitaSupply: String(raw["total_snacc_supply"] ?? "0"),
-    totalVitaBurned: String(raw["total_snacc_burned"] ?? "0"),
-    ruleBoundTreasury: String(raw["epoch_treasury_initial"] ?? "0"),
-    epochVolume: String(raw["volume_epoch"] ?? "0"),
+    totalVitaSupply: u128From(text, "total_snacc_supply"),
+    totalVitaBurned: u128From(text, "total_snacc_burned"),
+    ruleBoundTreasury: u128From(text, "epoch_treasury_initial"),
+    epochVolume: u128From(text, "volume_epoch"),
     history: [],
     contractId,
     blockHeight,
