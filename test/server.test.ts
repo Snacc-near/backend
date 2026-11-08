@@ -90,16 +90,12 @@ test("route: /api/strains/:id 404 strain_not_found", async () => {
   assert.deepEqual(res.body, { error: "strain_not_found" });
 });
 
-test("route: stub endpoint -> 501 dengan ID backlog", async () => {
-  for (const p of ["/api/tee/evaluate-genome"]) {
-    const res = await route(fakeReq(p), {
-      rpc: clientWithResult({}),
-      contractId: "c.near",
-      store: newStore(),
-    });
-    assert.equal(res.status, 501, p);
-    assert.ok((res.body as { todo: string }).todo.length > 0, p);
-  }
+test("route: evaluate-genome bukan lagi stub 501 (VC-015): GET -> 405, POST tanpa kunci -> 503", async () => {
+  const deps = { rpc: clientWithResult({}), contractId: "c.near", store: newStore() };
+  const get = await route({ url: "/api/tee/evaluate-genome", method: "GET" } as unknown as IncomingMessage, deps);
+  assert.equal(get.status, 405);
+  const post = await route({ url: "/api/tee/evaluate-genome", method: "POST" } as unknown as IncomingMessage, deps);
+  assert.deepEqual([post.status, post.body], [503, { error: "tee_not_configured" }]);
 });
 
 test("route: path tak dikenal -> 404", async () => {

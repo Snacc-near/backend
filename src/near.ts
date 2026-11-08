@@ -130,6 +130,31 @@ export class NearRpcClient {
     return { text, logs: r.logs, block_height: r.block_height };
   }
 
+  /**
+   * `view_access_key`: izin kunci pada akun, atau `null` bila kunci/akun tidak ada.
+   * Node melaporkan "tidak ada" sebagai error JSON-RPC atau sebagai `result.error` tanpa `permission`.
+   */
+  async viewAccessKey(accountId: string, publicKey: string): Promise<{ permission: unknown } | null> {
+    const missing = (s: string): boolean =>
+      /UNKNOWN_ACCESS_KEY|UNKNOWN_ACCOUNT|does not exist while viewing/i.test(s);
+    try {
+      const r = await this.fetchJsonRpc<{ permission?: unknown; error?: string }>("query", {
+        request_type: "view_access_key",
+        finality: "final",
+        account_id: accountId,
+        public_key: publicKey,
+      });
+      if (r.permission !== undefined) return { permission: r.permission };
+      if (typeof r.error === "string" && missing(r.error)) return null;
+      throw new RpcError({ code: -32603, message: "view_access_key tanpa permission" });
+    } catch (err) {
+      if (err instanceof RpcError && missing(`${err.rpcError.message} ${JSON.stringify(err.rpcError.data ?? "")}`)) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
   chunk(chunkHash: string): Promise<ChunkResult> {
     return this.fetchJsonRpc<ChunkResult>("chunk", { chunk_id: chunkHash });
   }
