@@ -82,10 +82,11 @@ const discoveryTx = (hash: string, height: number, tsNs: string, receiver = CONT
 const FED_EVENT = 'EVENT_JSON:{"standard":"snacc","version":"1.0.0","event":"fed","data":[{"kind":"fed","strain_id":1,"effective_fee":900,"atp_minted":2}]}';
 const CALLBACK_EVENT = 'EVENT_JSON:{"standard":"snacc","version":"1.0.0","event":"subaccount_materialized","data":[{"kind":"subaccount_materialized","strain_id":1,"sub_account_id":"s-1-0.snacc-v001.testnet"}]}';
 
+/** Real `tx` RPC shape (verified live): `receipts_outcome[].id` + `transaction_outcome.id` —
+ * there is NO `receipt_id` field on this RPC (INT-102 regression). */
 const txOutcome = (txLogs: string[], receiptLogs: string[][]) => ({
-  transaction_outcome: { outcome: { logs: txLogs } },
-  receipts_outcome: receiptLogs.map((logs, i) => ({ receipt_id: `rc-${i}`, outcome: { logs } })),
-  transaction: { hash: "T1" },
+  transaction_outcome: { outcome: { logs: txLogs } }, // no `id` → exercises the `tx:<hash>` fallback
+  receipts_outcome: receiptLogs.map((logs, i) => ({ id: `rc-${i}`, outcome: { logs } })),
 });
 
 test("backfill: the first discovery call fetches 50 and queues every new tx (budget 5/tick)", async () => {
@@ -332,4 +333,74 @@ test("the in-memory store drops the oldest events beyond MAX_EVENTS", () => {
   const s: CrucibleEvent = { kind: "strain_created", raw: { kind: "strain_created", strain_id: 7, owner_id: "a.testnet" } };
   absorbEvent(store, s);
   assert.equal(store.strainsSeen.get(7)?.owner_id, "a.testnet");
+});
+
+// ---------------------------------------------------------------------------
+// INT-102 regression: `receipt_id` must come from the real `tx` RPC shape.
+// Shape verified live (EXPERIMENTAL_tx_status, https://test.rpc.fastnear.com,
+// tx 9nn1E2DCSB35Neqs6KAuydiS8jw4EqUpsvPL1ibNshig on snacc-v001.testnet):
+//   receipts_outcome[i] = { id, block_hash, outcome, proof }  → field is `id`,
+//   transaction_outcome = { id, block_hash, outcome, proof }  (id = the tx hash).
+// Before the fix the mapper read `receipt_id` (absent) and every event fell back
+// to `unknown:<i>`, and the receipt dedupe key used that wrong value.
+// ---------------------------------------------------------------------------
+
+test("receipt_id on events equals the origin receipt id of the tx RPC result", () => {
+  const store = newEventStore();
+  const state = newPollerState();
+  const result = {
+    transaction_outcome: {
+      id: "9nn1E2DCSB35Neqs6KAuydiS8jw4EqUpsvPL1ibNshig",
+      outcome: { logs: [FED_EVENT] },
+    },
+    receipts_outcome: [
+      { id: "9ZuNLSQFp8PrTK1twte4Vg7Y3SSjLRs5Eokp2LqdGjE9", outcome: { logs: [CALLBACK_EVENT] } },
+      { id: "5QXgQuRLTCVLQC6yFtBgC7f6jjkWXFuFqxo2s3Evwibe", outcome: { logs: [] } },
+    ],
+  };
+  assert.equal(absorbTxOutcome(store, state, "T-real", result, 5), 2);
+  assert.deepEqual(
+    store.events.map((e) => e.receipt_id),
+    ["9nn1E2DCSB35Neqs6KAuydiS8jw4EqUpsvPL1ibNshig", "9ZuNLSQFp8PrTK1twte4Vg7Y3SSjLRs5Eokp2LqdGjE9"],
+    "every event carries the id of the receipt it came from — never `unknown:*`",
+  );
+  assert.ok(
+    store.events.every((e) => !String(e.receipt_id).startsWith("unknown:")),
+    "no unknown: fallback while the real ids are present",
+  );
+});
+
+test("receipt dedupe is keyed by the origin receipt id, not by the log content", () => {
+  const store = newEventStore();
+  const state = newPollerState();
+  const first = {
+    transaction_outcome: { outcome: { logs: [] } },
+    receipts_outcome: [{ id: "RC-AAA", outcome: { logs: [CALLBACK_EVENT] } }],
+  };
+  assert.equal(absorbTxOutcome(store, state, "T-dedupe", first, 5), 1);
+  // The same receipt id + same logs → deduped.
+  assert.equal(absorbTxOutcome(store, state, "T-dedupe", first, 5), 0);
+  // The SAME log under a DIFFERENT receipt id is a different receipt → absorbed again.
+  const other = {
+    transaction_outcome: { outcome: { logs: [] } },
+    receipts_outcome: [{ id: "RC-BBB", outcome: { logs: [CALLBACK_EVENT] } }],
+  };
+  assert.equal(absorbTxOutcome(store, state, "T-dedupe", other, 5), 1);
+  assert.equal(store.events.length, 2);
+  assert.deepEqual(store.events.map((e) => e.receipt_id), ["RC-AAA", "RC-BBB"]);
+});
+
+test("a missing receipt id falls back safely and still dedupes per tx", () => {
+  const store = newEventStore();
+  const state = newPollerState();
+  const bare = {
+    transaction_outcome: { outcome: { logs: [FED_EVENT] } }, // no `id` → `tx:<hash>` fallback
+    receipts_outcome: [{ outcome: { logs: [CALLBACK_EVENT] } }], // no `id` → stable last resort
+  };
+  assert.equal(absorbTxOutcome(store, state, "T-bare", bare, 5), 2);
+  assert.deepEqual(store.events.map((e) => e.receipt_id), ["tx:T-bare", "unknown:0"]);
+  // The fallback keys are stable across ticks → still deduped.
+  assert.equal(absorbTxOutcome(store, state, "T-bare", bare, 5), 0);
+  // …and they never collide with the same slot of ANOTHER tx.
+  assert.equal(absorbTxOutcome(store, state, "T-other", bare, 5), 2);
 });
