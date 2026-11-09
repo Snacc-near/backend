@@ -281,9 +281,11 @@ export async function pollOnce(
 /**
  * Run one poll tick under a watchdog: a hanging discovery/RPC (a fetch that never settles)
  * must end as a recorded failure + backoff, not an endless block of the poll loop.
- * The underlying `pollOnce` keeps running after the timeout — the caller's loop must not
- * start another tick until the previous one settles (see main.ts in-flight guard).
+ * The underlying `pollOnce` keeps running after the timeout, so it is tracked per state: while
+ * it has not settled, later ticks are skipped (counted in `backedOffTicks`) — never overlapped.
  */
+const inFlightPolls = new WeakMap<PollerState, Promise<unknown>>();
+
 export async function pollTick(
   rpc: PollerRpc,
   discoveryFetch: DiscoveryFetch,
@@ -292,11 +294,22 @@ export async function pollTick(
   state: PollerState,
   opts: { nowMs?: number; maxTxPerTick?: number; tickTimeoutMs?: number } = {},
 ): Promise<void> {
+  if (inFlightPolls.has(state)) {
+    // A previous pollOnce outlived its watchdog and is still running: skip, do not overlap.
+    state.backedOffTicks += 1;
+    return;
+  }
   const timeoutMs = opts.tickTimeoutMs ?? 30000;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const poll = pollOnce(rpc, discoveryFetch, contractId, store, state, opts.nowMs, opts.maxTxPerTick);
+  inFlightPolls.set(state, poll);
+  poll.then(
+    () => inFlightPolls.delete(state),
+    () => inFlightPolls.delete(state),
+  );
   try {
     await Promise.race([
-      pollOnce(rpc, discoveryFetch, contractId, store, state, opts.nowMs, opts.maxTxPerTick),
+      poll,
       new Promise<never>((_, rej) => {
         timer = setTimeout(
           () => rej(new Error(`poll tick timed out after ${timeoutMs}ms`)),

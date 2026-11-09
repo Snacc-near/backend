@@ -52,7 +52,8 @@ const discoveryFetch = (async (url: string) => {
   // The abort signal covers the fetch AND the body read (the body is pre-read and cached),
   // so a hanging NearBlocks response can never stall the poll loop.
   const res = await fetch(url, { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
-  const body = await res.json();
+  // Non-OK bodies (e.g. a 429 HTML page) are not parsed, so the HTTP status reaches pollOnce.
+  const body = res.ok ? await res.json() : null;
   return { ok: res.ok, status: res.status, json: async () => body };
 }) as import("./poller.js").DiscoveryFetch;
 

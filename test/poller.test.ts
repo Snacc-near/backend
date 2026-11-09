@@ -298,6 +298,16 @@ test("a hanging discovery ends as fail + backoff via the watchdog, not a hang", 
   assert.equal(store.indexerComplete, false); // honest: incomplete
   assert.equal(state.backoffAttempts, 1);
   assert.equal(state.backoffUntilMs, 1000 + BACKOFF_BASE_MS * 2); // backoff armed
+  // The timed-out pollOnce is still pending: a later tick (even past the backoff window)
+  // must be skipped instead of overlapping it.
+  let calls = 0;
+  const countingDiscovery = async () => {
+    calls += 1;
+    return { ok: true, status: 200, json: async () => ({ data: [] }) };
+  };
+  await pollTick(fx.rpc, countingDiscovery, CONTRACT, store, state, { nowMs: 10_000_000, tickTimeoutMs: 50 });
+  assert.equal(calls, 0, "no overlapping poll while the previous one is in flight");
+  assert.equal(state.backedOffTicks, 1);
 });
 
 test("absorbTxOutcome does not re-absorb already-seen receipts", () => {
