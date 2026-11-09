@@ -81,10 +81,17 @@ test("a hanging RPC fetch is aborted by the per-request timeout (no stall)", asy
     }) as unknown as Promise<Response>;
   }) as unknown as typeof fetch;
   const client = new NearRpcClient("http://rpc.test", fetchFn, 0, 50); // 50 ms timeout
-  await assert.rejects(
-    () => client.viewFunction("c.near", "get_macro_state", "e30="),
-    /aborted/i,
-  );
+  // AbortSignal.timeout uses an unref'd timer: keep the event loop alive (as the HTTP server
+  // does in production), otherwise Node 22 ends the test before the signal fires.
+  const keepAlive = setTimeout(() => {}, 5000);
+  try {
+    await assert.rejects(
+      () => client.viewFunction("c.near", "get_macro_state", "e30="),
+      /aborted/i,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
   assert.equal(aborted, true); // the timeout signal actually fired
 });
 
