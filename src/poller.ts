@@ -278,6 +278,62 @@ export async function pollOnce(
   return state;
 }
 
+/**
+ * Run one poll tick under a watchdog: a hanging discovery/RPC (a fetch that never settles)
+ * must end as a recorded failure + backoff, not an endless block of the poll loop.
+ * The underlying `pollOnce` keeps running after the timeout, so it is tracked per state: while
+ * it has not settled, later ticks are skipped (counted in `backedOffTicks`) — never overlapped.
+ */
+const inFlightPolls = new WeakMap<PollerState, Promise<unknown>>();
+
+export async function pollTick(
+  rpc: PollerRpc,
+  discoveryFetch: DiscoveryFetch,
+  contractId: string,
+  store: EventStore,
+  state: PollerState,
+  opts: { nowMs?: number; maxTxPerTick?: number; tickTimeoutMs?: number } = {},
+): Promise<void> {
+  if (inFlightPolls.has(state)) {
+    // A previous pollOnce outlived its watchdog and is still running: skip, do not overlap.
+    state.backedOffTicks += 1;
+    return;
+  }
+  const timeoutMs = opts.tickTimeoutMs ?? 30000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const poll = pollOnce(rpc, discoveryFetch, contractId, store, state, opts.nowMs, opts.maxTxPerTick);
+  inFlightPolls.set(state, poll);
+  poll.then(
+    () => inFlightPolls.delete(state),
+    () => inFlightPolls.delete(state),
+  );
+  try {
+    await Promise.race([
+      poll,
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () => rej(new Error(`poll tick timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } catch (err) {
+    // A timed-out tick is a failure like any other: record it honestly and arm the backoff
+    // (the in-flight pollOnce, if any, may still mutate state later — the caller skips ticks
+    // while a previous one is in flight, so there is no overlap).
+    state.lastError = String(err instanceof Error ? err.message : err);
+    state.caughtUp = false;
+    store.indexerComplete = false;
+    state.backoffAttempts += 1;
+    const now = opts.nowMs ?? Date.now();
+    state.backoffUntilMs =
+      now + Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(state.backoffAttempts, 10));
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** The NearBlocks v3 discovery URL for one account (no API key required). */
 export function pollerDiscoveryUrl(contractId: string): string {
   return `https://api-testnet.nearblocks.io/v3/accounts/${contractId}/txns`;

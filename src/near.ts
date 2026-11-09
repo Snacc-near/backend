@@ -74,16 +74,22 @@ export class NearRpcClient {
     private readonly fetchFn: typeof fetch = fetch,
     /** Base retry delay (ms) for HTTP 429/502/503/504 from public RPC; 0 = no delay (tests). */
     private readonly retryDelayMs: number = 400,
+    /** Per-request timeout (ms); a hanging RPC must not stall the poller. 0 = no timeout (tests). */
+    private readonly timeoutMs: number = 10000,
   ) {}
 
   async fetchJsonRpc<T>(method: string, params: unknown): Promise<T> {
     const payload = JSON.stringify({ jsonrpc: "2.0", id: "snacc-backend", method, params });
     let res!: Response;
     for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+      // A fresh timeout signal per attempt: a hanging RPC (no response) is aborted instead of
+      // stalling the poller loop. timeoutMs = 0 disables it (unit tests).
+      const signal = this.timeoutMs > 0 ? AbortSignal.timeout(this.timeoutMs) : undefined;
       res = await this.fetchFn(this.rpcUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: payload,
+        signal,
       });
       if (!RETRYABLE_STATUS.has(res.status) || attempt === RETRY_ATTEMPTS) break;
       await new Promise((ok) => setTimeout(ok, this.retryDelayMs * 2 ** attempt));

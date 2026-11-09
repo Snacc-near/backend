@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   pollOnce,
+  pollTick,
   absorbTxOutcome,
   newPollerState,
   BACKOFF_BASE_MS,
@@ -278,6 +279,35 @@ test("irrelevant accounts in the discovery feed are filtered out", async () => {
   await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
   assert.equal(state.processedTx, 1);
   assert.equal(store.events.length, 1);
+});
+
+test("a hanging discovery ends as fail + backoff via the watchdog, not a hang", async () => {
+  const fx = fixture([], { 104: ["c"] }, {});
+  const store = newEventStore();
+  const state = newPollerState();
+  // A discovery fetch that never settles (like a socket that hangs forever).
+  const hangingDiscovery = () => new Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>(() => {});
+  const t0 = Date.now();
+  await assert.rejects(
+    pollTick(fx.rpc, hangingDiscovery, CONTRACT, store, state, { nowMs: 1000, tickTimeoutMs: 50 }),
+    /timed out/,
+  );
+  assert.ok(Date.now() - t0 < 5000, "the watchdog must cut the tick off quickly");
+  assert.match(state.lastError ?? "", /timed out/);
+  assert.equal(state.caughtUp, false);
+  assert.equal(store.indexerComplete, false); // honest: incomplete
+  assert.equal(state.backoffAttempts, 1);
+  assert.equal(state.backoffUntilMs, 1000 + BACKOFF_BASE_MS * 2); // backoff armed
+  // The timed-out pollOnce is still pending: a later tick (even past the backoff window)
+  // must be skipped instead of overlapping it.
+  let calls = 0;
+  const countingDiscovery = async () => {
+    calls += 1;
+    return { ok: true, status: 200, json: async () => ({ data: [] }) };
+  };
+  await pollTick(fx.rpc, countingDiscovery, CONTRACT, store, state, { nowMs: 10_000_000, tickTimeoutMs: 50 });
+  assert.equal(calls, 0, "no overlapping poll while the previous one is in flight");
+  assert.equal(state.backedOffTicks, 1);
 });
 
 test("absorbTxOutcome does not re-absorb already-seen receipts", () => {

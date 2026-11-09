@@ -6,7 +6,7 @@
 import { createServer } from "node:http";
 import { NearRpcClient } from "./near.js";
 import { route, newStore } from "./server.js";
-import { pollOnce, newPollerState } from "./poller.js";
+import { pollTick, newPollerState } from "./poller.js";
 import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
@@ -40,27 +40,51 @@ server.listen(PORT, () => {
 });
 
 // Event poller v2 (INT-102/INT-104): discovery via the NearBlocks v3 account feed (1 call per
-// tick, no key), event logs via the NEAR `tx` RPC per new contract tx (budget 5/tick), and a
-// global exponential backoff on 429/5xx (backing-off ticks make NO API calls, so the other view
-// endpoints keep their RPC budget). Lag is logged every tick and exposed on /api/events as the
-// `x-indexer-lag-blocks` response header (no new body field — the spec does not define one).
+// tick, no key, 10 s abort timeout), event logs via the NEAR `tx` RPC per new contract tx
+// (budget 5/tick, 10 s client timeout), and a global exponential backoff on 429/5xx (backing-off
+// ticks make NO API calls, so the other view endpoints keep their RPC budget). The loop is a
+// chained setTimeout (never overlapping): the next tick is scheduled only after the current one
+// settles, and a tick that hangs is cut off by the pollTick watchdog and recorded as a failure.
+// Lag is logged every tick and exposed on /api/events as the `x-indexer-lag-blocks` response
+// header (no new body field — the spec does not define one).
+const DISCOVERY_TIMEOUT_MS = 10000;
 const discoveryFetch = (async (url: string) => {
-  const res = await fetch(url);
-  return { ok: res.ok, status: res.status, json: () => res.json() };
+  // The abort signal covers the fetch AND the body read (the body is pre-read and cached),
+  // so a hanging NearBlocks response can never stall the poll loop.
+  const res = await fetch(url, { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
+  // Non-OK bodies (e.g. a 429 HTML page) are not parsed, so the HTTP status reaches pollOnce.
+  const body = res.ok ? await res.json() : null;
+  return { ok: res.ok, status: res.status, json: async () => body };
 }) as import("./poller.js").DiscoveryFetch;
-const timer = setInterval(async () => {
-  try {
-    await pollOnce(rpc, discoveryFetch, CONTRACT_ID, store, pollerState);
-    console.log(
-      `poller: head=${pollerState.headHeight} cursor=${pollerState.cursorHeight} lag=${pollerState.lagBlocks} events=${store.events.length} dropped=${store.droppedEvents} queue=${pollerState.queue.length} 429s=${pollerState.rateLimitedErrors} backoffTicks=${pollerState.backedOffTicks}`,
-    );
-  } catch (err) {
-    console.error("poller:", String(err));
+
+let stopped = false;
+let inFlight = 0;
+let timer: ReturnType<typeof setTimeout>;
+async function tick(): Promise<void> {
+  if (stopped) return;
+  if (inFlight > 0) {
+    // A previous tick (or its in-flight pollOnce) has not settled — never overlap.
+    console.warn("poller: previous tick still in flight — skipping this tick");
+  } else {
+    inFlight += 1;
+    try {
+      await pollTick(rpc, discoveryFetch, CONTRACT_ID, store, pollerState);
+      console.log(
+        `poller: head=${pollerState.headHeight} cursor=${pollerState.cursorHeight} lag=${pollerState.lagBlocks} events=${store.events.length} dropped=${store.droppedEvents} queue=${pollerState.queue.length} 429s=${pollerState.rateLimitedErrors} backoffTicks=${pollerState.backedOffTicks}`,
+      );
+    } catch (err) {
+      console.error("poller:", String(err));
+    } finally {
+      inFlight -= 1;
+    }
   }
-}, POLL_INTERVAL_MS);
+  if (!stopped) timer = setTimeout(tick, POLL_INTERVAL_MS);
+}
+timer = setTimeout(tick, POLL_INTERVAL_MS);
 
 function shutdown(): void {
-  clearInterval(timer);
+  stopped = true;
+  clearTimeout(timer);
   server.close(() => process.exit(0));
 }
 process.on("SIGINT", shutdown);
