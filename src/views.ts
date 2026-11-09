@@ -11,6 +11,7 @@ import {
   quoteU128Fields,
 } from "./near.js";
 import { STRAIN_U128_FIELDS, type StrainVesselView } from "./macro.js";
+import type { CrucibleEvent } from "./events.js";
 
 export type NotDeployed = { error: "contract_not_deployed" };
 
@@ -275,6 +276,15 @@ export async function fetchAppetite(
 // /api/zones — current zone (view) + zone_changed history (event cache)
 // ---------------------------------------------------------------------------
 
+export interface ZoneHistoryEntry {
+  kind: string;
+  block_height: number | null;
+  receipt_id: string | null;
+  from_zone: string | null;
+  to_zone: string | null;
+  crucible_temp: number | null;
+}
+
 export interface ZonesResponse {
   current: {
     zone: string;
@@ -284,17 +294,40 @@ export interface ZonesResponse {
     fever_threshold_mk: number;
     hypothermia_threshold_mk: number;
   };
-  history: Array<Record<string, unknown>>;
-  history_complete: false;
+  history: ZoneHistoryEntry[];
+  history_complete: boolean;
+  indexer_incomplete: boolean;
   history_note: string;
   contractId: string;
   blockHeight: number;
 }
 
+/**
+ * Flatten absorbed `zone_changed` events into history entries (EN-106). Block height and
+ * receipt id come from the poller (`CrucibleEvent.block_height` / `receipt_id`); zone fields
+ * are copied verbatim from the event payload (`from_zone`, `to_zone`, `crucible_temp`). Missing
+ * values stay `null` — never fabricated. Entries are ordered ascending by block height
+ * (unknown height first), stable for equal heights (absorbed order).
+ */
+export function buildZoneHistory(events: CrucibleEvent[]): ZoneHistoryEntry[] {
+  return events
+    .filter((e) => e.kind === "zone_changed")
+    .map((e) => ({
+      kind: e.kind,
+      block_height: e.block_height ?? null,
+      receipt_id: e.receipt_id ?? null,
+      from_zone: (e.raw["from_zone"] as string) ?? null,
+      to_zone: (e.raw["to_zone"] as string) ?? null,
+      crucible_temp: (e.raw["crucible_temp"] as number) ?? null,
+    }))
+    .sort((a, b) => (a.block_height ?? 0) - (b.block_height ?? 0));
+}
+
 export async function fetchZones(
   client: NearRpcClient,
   contractId: string,
-  zoneEvents: Array<Record<string, unknown>>,
+  zoneEvents: CrucibleEvent[],
+  indexerComplete: boolean,
 ): Promise<ZonesResponse | NotDeployed> {
   return guarded(async () => {
     const [meter, macro] = await Promise.all([
@@ -319,8 +352,9 @@ export async function fetchZones(
         fever_threshold_mk: ms.params.fever_threshold_mk,
         hypothermia_threshold_mk: ms.params.hypothermia_threshold_mk,
       },
-      history: zoneEvents,
-      history_complete: false as const,
+      history: buildZoneHistory(zoneEvents),
+      history_complete: indexerComplete,
+      indexer_incomplete: !indexerComplete,
       history_note:
         "zone_changed history only includes events captured by the poller since process start; the contract does not expose a zone history view.",
       contractId,
