@@ -1,5 +1,6 @@
 /**
- * Server bootstrap (INT-101). Env: PORT, CONTRACT_ID, RPC_URLS (or legacy RPC_URL), POLL_INTERVAL_MS, NEAR_AI_API_KEY (optional, VC-015).
+ * Server bootstrap (INT-101). Env: PORT, CONTRACT_ID, RPC_URLS (or legacy RPC_URL), POLL_INTERVAL_MS,
+ * VIEW_CACHE_TTL_MS / VIEW_STALE_TTL_MS / RPC_COOLDOWN_BASE_MS, NEAR_AI_API_KEY (optional, VC-015).
  * Without env -> defaults to testnet + dictionary contract snacc-v001.testnet.
  */
 
@@ -15,15 +16,29 @@ const CONTRACT_ID = process.env["CONTRACT_ID"] ?? "snacc-v001.testnet";
 // `rpc.testnet.near.org` mostly answers 429 from cloud IPs, `near-testnet.lava.build` is gone
 // (HTTP 410) and `rpc.testnet.pagoda.co` requires auth (403). The client rotates a LIST of
 // endpoints (INT-104): `RPC_URLS` (comma-separated), with `RPC_URL` kept as a legacy fallback.
+// Defaults are the public testnet endpoints from the official NEAR docs provider list
+// (docs.near.org/api/rpc/providers): dRPC first (it carries the manual override in
+// production), then FastNear, then Intear; near.org last — officially deprecated and
+// severely rate-limited, kept only as a last resort.
 const RPC_URLS = (
-  process.env["RPC_URLS"] ?? process.env["RPC_URL"] ?? "https://near-testnet.drpc.org,https://test.rpc.fastnear.com"
+  process.env["RPC_URLS"] ??
+    process.env["RPC_URL"] ??
+    "https://near-testnet.drpc.org,https://test.rpc.fastnear.com,https://testnet-rpc.intea.rs,https://rpc.testnet.near.org"
 )
   .split(",")
   .map((u) => u.trim())
   .filter((u) => u.length > 0);
 const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 15000);
+// RPC pool tuning: view cache TTL (fresh), stale-if-error window, 429 cooldown base.
+const VIEW_CACHE_TTL_MS = Number(process.env["VIEW_CACHE_TTL_MS"] ?? 10_000);
+const VIEW_STALE_TTL_MS = Number(process.env["VIEW_STALE_TTL_MS"] ?? 120_000);
+const RPC_COOLDOWN_BASE_MS = Number(process.env["RPC_COOLDOWN_BASE_MS"] ?? 60_000);
 
-const rpc = new NearRpcClient(RPC_URLS);
+const rpc = new NearRpcClient(RPC_URLS, fetch, 400, 10000, {
+  viewCacheTtlMs: VIEW_CACHE_TTL_MS,
+  viewStaleTtlMs: VIEW_STALE_TTL_MS,
+  cooldownBaseMs: RPC_COOLDOWN_BASE_MS,
+});
 const store = newStore();
 const pollerState = newPollerState();
 // VC-015: NEAR AI key comes strictly from server env; never logged or returned. Empty -> 503 tee_not_configured.

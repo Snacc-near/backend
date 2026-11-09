@@ -117,6 +117,14 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
   const { rpc, contractId } = deps;
 
+  if (pathname === "/api/health") {
+    // Versioned liveness + RPC pooling snapshot (hosts, cooldowns, cache counters — no secrets).
+    return {
+      status: 200,
+      body: { ok: true, contractId, rpc: rpc.rpcStatus(), indexer_incomplete: !deps.store.indexerComplete },
+    };
+  }
+
   if (pathname === "/api/crucible/macro") {
     const macro = await fetchMacroState(rpc, contractId);
     if ("error" in macro) return { status: 503, body: macro };

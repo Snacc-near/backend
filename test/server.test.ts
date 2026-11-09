@@ -131,6 +131,28 @@ test("route: unknown path -> 404", async () => {
   assert.equal(res.status, 404);
 });
 
+test("route: /api/health reports rpc hosts, cooldowns and cache counters", async () => {
+  const res = await route(fakeReq("/api/health"), {
+    rpc: clientWithResult({ crucible_temp: 900 }),
+    contractId: "c.near",
+    store: newStore(),
+  });
+  assert.equal(res.status, 200);
+  const body = res.body as {
+    ok: boolean;
+    rpc: {
+      currentHost: string | null;
+      endpoints: Array<{ host: string; cooldownUntil: string | null }>;
+      cache: { hits: number; misses: number; staleServed: number; size: number };
+    };
+  };
+  assert.equal(body.ok, true);
+  // Host only — never the full URL.
+  assert.equal(body.rpc.endpoints[0]!.host, "rpc.test");
+  assert.equal(body.rpc.endpoints[0]!.cooldownUntil, null);
+  assert.equal(body.rpc.cache.hits, 0);
+});
+
 test("end-to-end HTTP server on port 0", async () => {
   const { createServer: createHttp } = await import("node:http");
   const srv = createHttp((req, res) => {
@@ -154,7 +176,7 @@ test("end-to-end HTTP server on port 0", async () => {
 test("CORS: GET/HEAD are readable cross-origin; POST (evaluate-genome) gets no CORS headers", () => {
   assert.deepEqual(corsHeaders("GET"), {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers": "x-indexer-lag-blocks",
+    "Access-Control-Expose-Headers": "x-indexer-lag-blocks, x-data-stale-seconds",
   });
   assert.equal(corsHeaders("HEAD")["Access-Control-Allow-Origin"], "*");
   assert.deepEqual(corsHeaders("POST"), {});
