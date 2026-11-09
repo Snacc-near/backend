@@ -200,13 +200,60 @@ test("/api/zones: current zone from view + history from event store (marked inco
   absorbEvent(d.store, { kind: "strain_created", raw: { kind: "strain_created", strain_id: 1, owner_id: "a" } });
   const res = await route(fakeReq("/api/zones"), d);
   assert.equal(res.status, 200);
-  const b = res.body as { current: { zone: string; fever_threshold_mk: number; hypothermia_threshold_mk: number; last_zone: string }; history: unknown[]; history_complete: boolean };
+  const b = res.body as { current: { zone: string; fever_threshold_mk: number; hypothermia_threshold_mk: number; last_zone: string }; history: unknown[]; history_complete: boolean; indexer_incomplete: boolean };
   assert.equal(b.current.zone, "FEVER");
   assert.equal(b.current.last_zone, "Fever");
   assert.equal(b.current.fever_threshold_mk, 610);
   assert.equal(b.current.hypothermia_threshold_mk, 600);
   assert.equal(b.history.length, 1);
   assert.equal(b.history_complete, false);
+  assert.equal(b.indexer_incomplete, true);
+});
+
+test("/api/zones: history entries carry block_height/receipt_id + exact contract fields (EN-106)", async () => {
+  const rpc = rpcByMethod({
+    get_appetite_meter: () => '{"zone":"FEVER","crucible_temp":673,"current_epoch":2,"feast_volume":1,"feast_target":2}',
+    get_macro_state: () =>
+      '{"last_zone":"Fever","params":{"fever_threshold_mk":610,"hypothermia_threshold_mk":600}}',
+  });
+  const d = deps(rpc);
+  // Absorb out of order: response must be ascending by block height.
+  absorbEvent(d.store, { kind: "zone_changed", block_height: 300, receipt_id: "r2", raw: { kind: "zone_changed", from_zone: "NORMAL", to_zone: "FEVER", crucible_temp: 1500 } });
+  absorbEvent(d.store, { kind: "zone_changed", block_height: 100, receipt_id: "r1", raw: { kind: "zone_changed", from_zone: "HYPOTHERMIA", to_zone: "NORMAL", crucible_temp: 650 } });
+  absorbEvent(d.store, { kind: "strain_created", raw: { kind: "strain_created", strain_id: 9 } });
+  d.store.indexerComplete = true;
+  const res = await route(fakeReq("/api/zones"), d);
+  assert.equal(res.status, 200);
+  const b = res.body as { history: Array<{ kind: string; block_height: number | null; receipt_id: string | null; from_zone: string | null; to_zone: string | null; crucible_temp: number | null }>; history_complete: boolean; indexer_incomplete: boolean; current: { zone: string } };
+  assert.equal(b.current.zone, "FEVER");
+  assert.deepEqual(b.history, [
+    { kind: "zone_changed", block_height: 100, receipt_id: "r1", from_zone: "HYPOTHERMIA", to_zone: "NORMAL", crucible_temp: 650 },
+    { kind: "zone_changed", block_height: 300, receipt_id: "r2", from_zone: "NORMAL", to_zone: "FEVER", crucible_temp: 1500 },
+  ]);
+  assert.equal(b.history_complete, true);
+  assert.equal(b.indexer_incomplete, false);
+});
+
+test("/api/zones: no fabrication — missing poller metadata stays null; empty store is honest", async () => {
+  const rpc = rpcByMethod({
+    get_appetite_meter: () => '{"zone":"NORMAL","crucible_temp":900,"current_epoch":0,"feast_volume":0,"feast_target":1}',
+    get_macro_state: () =>
+      '{"last_zone":"Normal","params":{"fever_threshold_mk":1400,"hypothermia_threshold_mk":600}}',
+  });
+  const d = deps(rpc);
+  absorbEvent(d.store, { kind: "zone_changed", raw: { kind: "zone_changed" } });
+  const res = await route(fakeReq("/api/zones"), d);
+  assert.equal(res.status, 200);
+  const b = res.body as { history: Array<{ block_height: null; receipt_id: null; from_zone: null; to_zone: null; crucible_temp: null }>; indexer_incomplete: boolean };
+  assert.deepEqual(b.history, [{ kind: "zone_changed", block_height: null, receipt_id: null, from_zone: null, to_zone: null, crucible_temp: null }]);
+  assert.equal(b.indexer_incomplete, true);
+
+  const empty = await route(fakeReq("/api/zones"), deps(rpc));
+  assert.equal(empty.status, 200);
+  const e = empty.body as { history: unknown[]; indexer_incomplete: boolean; history_complete: boolean };
+  assert.deepEqual(e.history, []);
+  assert.equal(e.indexer_incomplete, true);
+  assert.equal(e.history_complete, false);
 });
 
 test("view routes -> 503 contract_not_deployed when contract account is missing", async () => {

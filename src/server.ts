@@ -177,12 +177,15 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
   }
 
   if (pathname === "/api/zones") {
-    const zoneEvents = deps.store.events
-      .filter((e) => e.kind === "zone_changed")
-      .map((e) => e.raw);
-    const out = await fetchZones(rpc, contractId, zoneEvents);
+    const zoneEvents = deps.store.events.filter((e) => e.kind === "zone_changed");
+    const out = await fetchZones(rpc, contractId, zoneEvents, deps.store.indexerComplete);
     if ("error" in out) return { status: 503, body: out };
-    return { status: 200, body: out };
+    const lag = deps.poller?.lagBlocks ?? null;
+    return {
+      status: 200,
+      body: out,
+      headers: lag === null ? undefined : { "x-indexer-lag-blocks": String(lag) },
+    };
   }
 
   if (pathname === "/api/tee/attestation-report") {
