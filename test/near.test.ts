@@ -70,6 +70,24 @@ test("HTTP 429 is retried with backoff, then succeeds", async () => {
   assert.equal(calls, 3);
 });
 
+test("a hanging RPC fetch is aborted by the per-request timeout (no stall)", async () => {
+  let aborted = false;
+  const fetchFn = ((_url: unknown, init?: { signal?: AbortSignal }) => {
+    return new Promise<Response>((_, rej) => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+        rej(new Error("The operation was aborted"));
+      });
+    }) as unknown as Promise<Response>;
+  }) as unknown as typeof fetch;
+  const client = new NearRpcClient("http://rpc.test", fetchFn, 0, 50); // 50 ms timeout
+  await assert.rejects(
+    () => client.viewFunction("c.near", "get_macro_state", "e30="),
+    /aborted/i,
+  );
+  assert.equal(aborted, true); // the timeout signal actually fired
+});
+
 test("persistent HTTP 429 exhausts the retries and throws RpcError", async () => {
   let calls = 0;
   const fetchFn = (async () => {

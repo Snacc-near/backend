@@ -278,6 +278,49 @@ export async function pollOnce(
   return state;
 }
 
+/**
+ * Run one poll tick under a watchdog: a hanging discovery/RPC (a fetch that never settles)
+ * must end as a recorded failure + backoff, not an endless block of the poll loop.
+ * The underlying `pollOnce` keeps running after the timeout — the caller's loop must not
+ * start another tick until the previous one settles (see main.ts in-flight guard).
+ */
+export async function pollTick(
+  rpc: PollerRpc,
+  discoveryFetch: DiscoveryFetch,
+  contractId: string,
+  store: EventStore,
+  state: PollerState,
+  opts: { nowMs?: number; maxTxPerTick?: number; tickTimeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.tickTimeoutMs ?? 30000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      pollOnce(rpc, discoveryFetch, contractId, store, state, opts.nowMs, opts.maxTxPerTick),
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () => rej(new Error(`poll tick timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } catch (err) {
+    // A timed-out tick is a failure like any other: record it honestly and arm the backoff
+    // (the in-flight pollOnce, if any, may still mutate state later — the caller skips ticks
+    // while a previous one is in flight, so there is no overlap).
+    state.lastError = String(err instanceof Error ? err.message : err);
+    state.caughtUp = false;
+    store.indexerComplete = false;
+    state.backoffAttempts += 1;
+    const now = opts.nowMs ?? Date.now();
+    state.backoffUntilMs =
+      now + Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(state.backoffAttempts, 10));
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** The NearBlocks v3 discovery URL for one account (no API key required). */
 export function pollerDiscoveryUrl(contractId: string): string {
   return `https://api-testnet.nearblocks.io/v3/accounts/${contractId}/txns`;
