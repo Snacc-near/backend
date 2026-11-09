@@ -1,77 +1,77 @@
 # backend
 
-M5 indexer-api: pemindai event `NEP-297` + endpoint `/api/crucible/*`. Backlog: `INT-101..108`, `VC-020..023`.
+M5 indexer-api: `NEP-297` event scanner + `/api/crucible/*` endpoints. Backlog: `INT-101..108`, `VC-020..023`.
 
 ## Status (scaffold `INT-101..108`)
 
-Node.js + TypeScript murni (`node:http`, 0 dependency runtime). Kontrak dikonfigurasi lewat env — default testnet:
+Pure Node.js + TypeScript (`node:http`, 0 runtime dependencies). The contract is configured via env — testnet by default:
 
 ```bash
 npm install
-npm test                      # unit test (RPC + NEAR AI Cloud di-stub, tidak butuh jaringan)
-CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (RPC default https://test.rpc.fastnear.com; override via RPC_URL)
+npm test                      # unit tests (RPC + NEAR AI Cloud stubbed, no network needed)
+CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (default RPC https://test.rpc.fastnear.com; override via RPC_URL)
 ```
 
 | Endpoint | Status |
 | --- | :-: |
-| `GET /api/crucible/macro` | ✅ live dari RPC `get_macro_state` (503 + `contract_not_deployed` bila kontrak belum ada) |
-| `GET /api/strains` (alias `/api/crucible/strains`) | ✅ live: `nft_total_supply` + `get_strain` per id → `{strains, starvingCount, liquidatedCount, splicedCount, totalMinted, truncated}` (maks 200) |
-| `GET /api/strains/:id` | ✅ live dari RPC `get_strain` (404 bila tidak ada) |
-| `GET /api/strains/:id/svg` (alias `/api/crucible/strains/:id/svg`) | ✅ live: SVG NEP-177 didekode dari `nft_token.metadata.media` → `image/svg+xml` |
-| `GET /api/colony/:owner` | ✅ live: `get_colony` + `get_colony_atp` (400 bila account id tak valid) |
-| `GET /api/dividends[?epoch=&strain_id=]` | ✅ live: `get_dividend_pool` + `get_epoch_dividend_rate` (24 epoch terakhir) + `get_dividend_contribution` opsional |
-| `GET /api/appetite` | ✅ live: `get_appetite_meter` + `get_top_feeder` (epoch berjalan) |
-| `GET /api/zones` | 🟡 zona sekarang live (`get_appetite_meter` + `get_macro_state`); riwayat `zone_changed` hanya dari event cache dan ditandai `history_complete:false` (kontrak tidak punya view riwayat zona) |
-| `GET /api/tee/attestation-report` | ✅ live: proxy publik `cloud-api.near.ai/v1/attestation/report` (cache 60 dtk) → `{model, signingAddress, gatewayAttestation, modelAttestations}` |
-| `GET /api/events` | 🔴 poller tidak berfungsi — lihat catatan di bawah; selalu `indexer_incomplete:true` |
-| `POST /api/tee/evaluate-genome` | ✅ (`VC-015`) Tahap 1–3 nyata, dipagari — lihat bagian di bawah. Tanpa `NEAR_AI_API_KEY` di env server → `503 {error:"tee_not_configured"}` (backend publik sengaja tanpa kunci) |
+| `GET /api/crucible/macro` | ✅ live from RPC `get_macro_state` (503 + `contract_not_deployed` if the contract is not deployed) |
+| `GET /api/strains` (alias `/api/crucible/strains`) | ✅ live: `nft_total_supply` + `get_strain` per id → `{strains, starvingCount, liquidatedCount, splicedCount, totalMinted, truncated}` (max 200) |
+| `GET /api/strains/:id` | ✅ live from RPC `get_strain` (404 if not found) |
+| `GET /api/strains/:id/svg` (alias `/api/crucible/strains/:id/svg`) | ✅ live: NEP-177 SVG decoded from `nft_token.metadata.media` → `image/svg+xml` |
+| `GET /api/colony/:owner` | ✅ live: `get_colony` + `get_colony_atp` (400 if account id is invalid) |
+| `GET /api/dividends[?epoch=&strain_id=]` | ✅ live: `get_dividend_pool` + `get_epoch_dividend_rate` (last 24 epochs) + optional `get_dividend_contribution` |
+| `GET /api/appetite` | ✅ live: `get_appetite_meter` + `get_top_feeder` (current epoch) |
+| `GET /api/zones` | 🟡 current zone is live (`get_appetite_meter` + `get_macro_state`); `zone_changed` history comes only from the in-memory event cache and is marked `history_complete:false` (the contract has no zone history view) |
+| `GET /api/tee/attestation-report` | ✅ live: public proxy for `cloud-api.near.ai/v1/attestation/report` (60s cache) → `{model, signingAddress, gatewayAttestation, modelAttestations}` |
+| `GET /api/events` | 🔴 poller non-functional — see note below; always returns `indexer_incomplete:true` |
+| `POST /api/tee/evaluate-genome` | ✅ (`VC-015`) Stages 1–3 live, gated — see section below. Without `NEAR_AI_API_KEY` in the server env → `503 {error:"tee_not_configured"}` (public backend intentionally runs without a key) |
 
 ### `POST /api/tee/evaluate-genome` (VC-015)
 
-Kunci `NEAR_AI_API_KEY` hanya dibaca dari env server (`node --env-file=...`), hanya dikirim ke `cloud-api.near.ai`, tidak pernah di-log/dikembalikan. Hanya **pemilik strain** yang boleh memanggil, dibuktikan dengan pesan **NEP-413** (`signMessage` dompet):
+The `NEAR_AI_API_KEY` is read strictly from the server environment (`node --env-file=...`), sent only to `cloud-api.near.ai`, and never logged or returned. Only the **strain owner** may call this endpoint, proven with a signed **NEP-413** message (wallet `signMessage`):
 
 ```jsonc
 // request  (Content-Type: application/json, ≤ 16 KB)
 {
   "strain_id": 5,
-  "payload_text": "…teks katalis (akun/email/kunci disensor Layer 1)…",   // ≤ 4000 karakter
-  "raw_formula": "Ignis-Spore: 3, Lumin-Spore: 2",                          // ≤ 1000 karakter, disembunyikan di balik komitmen
+  "payload_text": "…catalyst text (account/email/key redacted by Layer 1)…",   // ≤ 4000 chars
+  "raw_formula": "Ignis-Spore: 3, Lumin-Spore: 2",                              // ≤ 1000 chars, hidden behind commitment
   "auth": {
     "account_id": "alice.testnet",
-    "public_key": "ed25519:…",        // harus kunci FullAccess milik akun (view_access_key)
-    "signature": "<base64 64 byte>",
-    "nonce": "<base64 32 byte acak, sekali pakai>",
-    "message": "{\"action\":\"evaluate-genome\",\"strain_id\":5,\"timestamp\":1800000000000}"  // timestamp = ms epoch
+    "public_key": "ed25519:…",        // must be a FullAccess key owned by the account (view_access_key)
+    "signature": "<base64 64 bytes>",
+    "nonce": "<base64 32 random bytes, single-use>",
+    "message": "{\"action\":\"evaluate-genome\",\"strain_id\":5,\"timestamp\":1800000000000}"  // timestamp = epoch ms
   }
 }
 ```
 
-Penanda tangan memakai `recipient: "snacc-backend"` dan tanpa `callbackUrl`. Syarat: `message.strain_id` = `strain_id` body, `account_id` = `owner_id` strain (`get_strain`), `timestamp` tidak lebih tua dari 5 menit (maks 60 dtk di depan), nonce belum pernah dipakai.
+The signer uses `recipient: "snacc-backend"` and no `callbackUrl`. Requirements: `message.strain_id` = body `strain_id`, `account_id` = strain `owner_id` (`get_strain`), `timestamp` no older than 5 minutes (max 60s clock skew into the future), and `nonce` never used before.
 
 ```jsonc
 // 200
 { "chatId", "signedText", "signatureHex", "signingAddress",
-  "raw_response_body",               // string: byte respons enclave utuh (untuk apply)
+  "raw_response_body",               // string: exact raw enclave response bytes (for on-chain apply)
   "mutation": { "efficiency_shift_bps", "vitality_bonus", "phenotype_trait" },
   "redactionReport": { "redaction_mode", "classification", "warnings", "commitment_hex", "salt_hex",
                        "request_sha256_hex", "payload_terredaksi", "signature_verified" } }
 ```
 
-**Langkah lanjutan commit → apply on-chain** (dilakukan klien/FE dengan dompet pemilik; backend tidak pernah menandatangani transaksi). Hash request baru diketahui sesudah panggilan ini (salt acak server), sehingga `commit` dilakukan sesudahnya:
+**Follow-up commit → apply on-chain steps** (performed by the client/FE with the owner's wallet; the backend never signs transactions). The request hash is known only after this call (random server salt), so `commit` is submitted right after:
 
-1. `signer` enclave (`signingAddress`, hex 32 byte) harus sudah terdaftar di kontrak lewat `register_attested_signer` (khusus owner kontrak) — satu kali.
+1. The enclave `signer` (`signingAddress`, 32-byte hex) must already be registered on the contract via `register_attested_signer` (contract owner only) — one-time setup.
 2. `commit_genome_experiment({ strain_id, req_sha256_hex: redactionReport.request_sha256_hex })`.
-3. `apply_tee_mutation_zero_trust({ strain_id, req_sha256_hex: redactionReport.request_sha256_hex, raw_response_body, signature_hex: signatureHex, tee_pubkey_hex: signingAddress })`. `raw_response_body` harus dikirim **tanpa diubah satu byte pun** (kontrak menghitung ulang sha256-nya dan mencocokkan dengan `signedText`); `chatId` dipakai sekali (anti-replay).
-4. Kontrak menolak bila `strain_id` di payload mutasi ≠ `strain_id` transaksi — gunakan `strain_id` yang sama dengan request evaluate.
+3. `apply_tee_mutation_zero_trust({ strain_id, req_sha256_hex: redactionReport.request_sha256_hex, raw_response_body, signature_hex: signatureHex, tee_pubkey_hex: signingAddress })`. `raw_response_body` must be passed **without altering a single byte** (the contract recomputes its sha256 and matches it against `signedText`); `chatId` is single-use (anti-replay).
+4. The contract rejects the call if `strain_id` inside the mutation payload ≠ transaction `strain_id` — use the same `strain_id` as the evaluate request.
 
-Catatan jujur: urutan ADR-21 fase 1 ("commit sebelum memanggil enclave") tidak tercapai di jalur ini; commit hanya mengikat hash yang sudah dihitung.
+Honesty note: the strict ADR-21 phase-1 ordering ("commit before calling the enclave") is not achieved on this server-salted path; the commit binds the hash after it has been computed.
 
-Galat: `400 invalid_request|invalid_json|invalid_account_id` · `401 auth_required|invalid_message|signature_expired|invalid_nonce|nonce_reused|invalid_signature` · `403 public_key_not_owned|public_key_not_full_access|not_strain_owner` · `404 strain_not_found` · `405` (bukan POST) · `413 body_too_large` · `429 rate_limited` (+ header `Retry-After`; **3/jam per strain**, **50/hari total**, in-memory) · `502 tee_upstream_failed|tee_guardrail_rejected` · `503 tee_not_configured|rpc_unavailable|contract_not_deployed`.
+Errors: `400 invalid_request|invalid_json|invalid_account_id` · `401 auth_required|invalid_message|signature_expired|invalid_nonce|nonce_reused|invalid_signature` · `403 public_key_not_owned|public_key_not_full_access|not_strain_owner` · `404 strain_not_found` · `405` (not POST) · `413 body_too_large` · `429 rate_limited` (+ `Retry-After` header; **3/hour per strain**, **50/day total**, in-memory) · `502 tee_upstream_failed|tee_guardrail_rejected` · `503 tee_not_configured|rpc_unavailable|contract_not_deployed`.
 
-Logika redaksi + klien enclave di `src/oracle/` adalah salinan terversi dari repo `oracle-tee` (lihat `src/oracle/SYNC.md`; ada test drift). Endpoint ini tidak memberi CORS; panggil dari server/proxy yang sama dengan frontend.
+The redaction logic + enclave client in `src/oracle/` is a versioned copy from the `oracle-tee` repo (see `src/oracle/SYNC.md`; guarded by a drift test). This endpoint does not set CORS headers; call it from the same origin/proxy as the frontend.
 
-Prinsip: **tidak pernah mengarang data** — endpoint yang belum diimplement merespons `501 {error:"not_implemented", todo:"<ID>"}`; kontrak belum deploy → `503 {error:"contract_not_deployed"}`; RPC hulu gagal/ditolak (mis. 429 setelah 3 retry) → `503 {error:"rpc_unavailable"}`. u128 dan sentinel u64 besar (`atp_balance`, `feast_volume`, `last_allocate_epoch`, …) selalu **string** presisi.
+Principle: **never fabricate data** — unimplemented endpoints respond `501 {error:"not_implemented", todo:"<ID>"}`; undeployed contract → `503 {error:"contract_not_deployed"}`; upstream RPC failure/rejection (e.g. 429 after 3 retries) → `503 {error:"rpc_unavailable"}`. `u128` fields and large `u64` sentinels (`atp_balance`, `feast_volume`, `last_allocate_epoch`, …) are always exact **strings**.
 
-**Catatan poller event (`INT-102` lanjutan, belum tuntas):** RPC `chunk` tidak membawa log eksekusi (hanya receipt mentah) dan `block.header.chunk_ids` tidak ada (field-nya `block.chunks[]`), jadi poller tidak pernah menangkap event. Indexer yang benar perlu `EXPERIMENTAL_tx_status` per transaksi ke kontrak atau indexer eksternal. Karena itu daftar strain kini dibaca dari view, bukan dari event.
+**Event poller note (`INT-102` follow-up, not yet complete):** RPC `chunk` does not carry execution logs (only raw receipts) and `block.header.chunk_ids` does not exist (the field is `block.chunks[]`), so the poller never captures events. A complete indexer requires `EXPERIMENTAL_tx_status` per contract transaction or an external indexer. Therefore the strain list is now read from contract views rather than events.
 
-Spec: `snacc-vault/` · Skema JSON: [`docs/api-schemas.md`](../docs/api-schemas.md) di repo payung.
+Spec: `snacc-vault/` · JSON schemas: [`docs/api-schemas.md`](../docs/api-schemas.md) in the umbrella repo.

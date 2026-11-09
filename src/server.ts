@@ -1,8 +1,8 @@
 /**
- * Router HTTP /api/* (INT-101..103, VC-020, INT-105..106, VC-015). Node murni, tanpa framework.
- * Semua data dari view kontrak / enclave NEAR AI Cloud; endpoint yang sumber datanya belum ada
- * merespons 501 + ID backlog — tidak pernah mengarang data. `POST /api/tee/evaluate-genome` (VC-015)
- * dipagari kunci server + tanda tangan NEP-413 pemilik strain + rate limit (lihat evaluate.ts).
+ * HTTP router /api/* (INT-101..103, VC-020, INT-105..106, VC-015). Pure Node, no framework.
+ * All data comes from contract views / NEAR AI Cloud enclave; endpoints whose data source does not yet exist
+ * respond 501 + backlog ID — never fabricating data. `POST /api/tee/evaluate-genome` (VC-015)
+ * is gated by the server key + strain owner NEP-413 signature + rate limit (see evaluate.ts).
  */
 
 import { IncomingMessage } from "node:http";
@@ -25,9 +25,9 @@ export interface RouterDeps {
   rpc: NearRpcClient;
   contractId: string;
   store: EventStore;
-  /** Injeksi untuk test; default `fetch` global. Dipakai route `/api/tee/attestation-report`. */
+  /** Injection hook for tests; defaults to global `fetch`. Used by route `/api/tee/attestation-report`. */
   fetchFn?: FetchLike;
-  /** Pagar `POST /api/tee/evaluate-genome` (VC-015); tanpa ini endpoint 503 `tee_not_configured`. */
+  /** Gate for `POST /api/tee/evaluate-genome` (VC-015); without this, the endpoint returns 503 `tee_not_configured`. */
   evaluate?: EvaluateDeps;
 }
 
@@ -38,7 +38,7 @@ export interface RouterResult {
   headers?: Record<string, string>;
 }
 
-/** Baca body JSON ≤ `max` byte dari stream request; `null` bila terlalu besar, `undefined` bila bukan JSON. */
+/** Read a JSON body ≤ `max` bytes from the request stream; returns `null` if too large, `undefined` if invalid JSON. */
 async function readJsonBody(req: IncomingMessage, max: number): Promise<unknown | null | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -55,7 +55,7 @@ async function readJsonBody(req: IncomingMessage, max: number): Promise<unknown 
   }
 }
 
-/** Hasil view `{error}` -> status HTTP. */
+/** Map view `{error}` result -> HTTP status code. */
 function statusOfError(error: string): number {
   if (error === "strain_not_found") return 404;
   if (error === "svg_media_unavailable") return 502;
@@ -67,7 +67,7 @@ function intParam(v: string | null): number | undefined {
   return Number(v);
 }
 
-/** RPC hulu gagal (429 habis retry, 5xx, dll.) -> 503 jujur, bukan 500 internal. */
+/** Upstream RPC failure (429 exhausted retries, 5xx, etc.) -> honest 503, not internal 500. */
 export async function route(req: IncomingMessage, deps: RouterDeps): Promise<RouterResult> {
   try {
     return await routeInner(req, deps);
@@ -90,13 +90,13 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
     return { status: 200, body: macro };
   }
 
-  // `/api/crucible/strains[...]` = alias spec (Spec API Backend §2).
+  // `/api/crucible/strains[...]` = spec alias (Backend API Spec §2).
   const p = pathname.replace(/^\/api\/crucible\/strains/, "/api/strains");
 
   if (p === "/api/strains") {
     const list = await fetchStrainList(rpc, contractId);
     if ("error" in list) return { status: 503, body: list };
-    // `indexer_incomplete` tetap ada demi kompatibilitas: daftar kini dari view kontrak, bukan event.
+    // `indexer_incomplete` is retained for backwards compatibility: the list now comes from contract views, not events.
     return { status: 200, body: { ...list, indexer_incomplete: false } };
   }
 
@@ -108,7 +108,7 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
       status: 200,
       body: out.svg,
       contentType: "image/svg+xml; charset=utf-8",
-      // SVG dari kontrak diperlakukan sebagai gambar pasif: tanpa script/fetch bila dibuka langsung.
+      // Contract-supplied SVG is treated as a passive image: no script/fetch execution if opened directly.
       headers: { "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox" },
     };
   }
@@ -128,7 +128,7 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
     try {
       owner = decodeURIComponent(owner);
     } catch {
-      // percent-encoding rusak -> ditolak validasi di bawah
+      // malformed percent-encoding -> rejected by validation below
     }
     if (!isValidAccountId(owner)) {
       return { status: 400, body: { error: "invalid_account_id", owner_id: owner } };
@@ -189,7 +189,7 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
     if (req.method !== "POST") {
       return { status: 405, body: { error: "method_not_allowed" }, headers: { Allow: "POST" } };
     }
-    // Tanpa kunci server: tolak dulu, sebelum membaca body atau memanggil RPC.
+    // Without server key: reject immediately before reading body or calling RPC.
     if (!deps.evaluate?.apiKey) return { status: 503, body: { error: "tee_not_configured" } };
     const body = await readJsonBody(req, MAX_BODY_BYTES);
     if (body === null) return { status: 413, body: { error: "body_too_large", maxBytes: MAX_BODY_BYTES } };

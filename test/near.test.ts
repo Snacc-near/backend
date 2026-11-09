@@ -18,14 +18,14 @@ const VIEW_RESULT = {
   block_hash: "AAA",
 };
 
-test("viewFunction mendekode hasil JSON", async () => {
+test("viewFunction decodes JSON result", async () => {
   const client = clientWith({ jsonrpc: "2.0", id: "x", result: VIEW_RESULT });
   const r = await client.viewFunction("c.near", "get_macro_state", "e30=");
   assert.equal(r.text, '{"crucible_temp":900}');
   assert.equal(r.block_height, 12345);
 });
 
-test("RpcError dibuang saat JSON-RPC error", async () => {
+test("RpcError is thrown on JSON-RPC error", async () => {
   const client = clientWith({
     jsonrpc: "2.0",
     id: "x",
@@ -37,7 +37,7 @@ test("RpcError dibuang saat JSON-RPC error", async () => {
   );
 });
 
-test("isContractNotDeployed mengenali UNKNOWN_ACCOUNT & ContractCodeNotFound", () => {
+test("isContractNotDeployed recognizes UNKNOWN_ACCOUNT & ContractCodeNotFound", () => {
   const unknownAccount = new RpcError({
     code: -32000,
     message: "Server error",
@@ -51,5 +51,5 @@ test("isContractNotDeployed mengenali UNKNOWN_ACCOUNT & ContractCodeNotFound", (
   assert.equal(isContractNotDeployed(unknownAccount), true);
   assert.equal(isContractNotDeployed(codeNotFound), true);
   assert.equal(isContractNotDeployed(other), false);
-  assert.equal(isContractNotDeployed(new Error("biasa")), false);
+  assert.equal(isContractNotDeployed(new Error("plain")), false);
 });

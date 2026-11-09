@@ -22,7 +22,7 @@ const CONTRACT = "snacc-v001.testnet";
 const API_KEY = "sk-test-SECRET-key-0123456789abcdef";
 const OWNER = "alice.testnet";
 
-// ---- util tes: base58 encode + NEP-413 independen dari src (borsh manual) ----
+// ---- test utils: base58 encode + NEP-413 independent of src (manual Borsh) ----
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58enc(buf: Buffer): string {
   let n = BigInt("0x" + (buf.toString("hex") || "0"));
@@ -84,9 +84,9 @@ const signer = newKey();
 
 // ---- mock RPC ----
 interface RpcMock {
-  keyPermission?: unknown; // undefined = kunci tidak ada
+  keyPermission?: unknown; // undefined = key does not exist
   keyMissingStyle?: "result" | "jsonrpc";
-  strainOwner?: string | null; // null = strain tak ada
+  strainOwner?: string | null; // null = strain does not exist
   calls: string[];
 }
 function mockRpc(m: RpcMock): NearRpcClient {
@@ -159,7 +159,7 @@ const err = (r: { body: unknown }) => (r.body as { error: string }).error;
 
 test.beforeEach(() => clearExperimentCache());
 
-test("nep413: base58 + parse kunci publik", () => {
+test("nep413: base58 + parse public key", () => {
   assert.equal(base58Decode("2NEpo7TZRRrLZSi2U")?.toString(), "Hello World!");
   assert.deepEqual([...(base58Decode("1112") as Buffer)], [0, 0, 0, 1]);
   assert.equal(base58Decode("0OIl"), null);
@@ -168,7 +168,7 @@ test("nep413: base58 + parse kunci publik", () => {
   assert.equal(parseEd25519PublicKey("ed25519:abc"), null);
 });
 
-test("tanpa NEAR_AI_API_KEY -> 503 tee_not_configured, tanpa panggilan RPC/TEE", async () => {
+test("without NEAR_AI_API_KEY -> 503 tee_not_configured, no RPC/TEE calls", async () => {
   const calls: string[] = [];
   const tee: TeeMock = { urls: [], auths: [] };
   const r = await evaluateGenome(body(makeAuth()), okRpc(calls), CONTRACT, deps({ apiKey: undefined }, tee));
@@ -178,7 +178,7 @@ test("tanpa NEAR_AI_API_KEY -> 503 tee_not_configured, tanpa panggilan RPC/TEE",
   assert.equal(tee.urls.length, 0);
 });
 
-test("jalur sukses: 200, bentuk spec, kunci hanya ke cloud-api.near.ai & tak bocor di respons", async () => {
+test("success path: 200, spec shape, key sent only to cloud-api.near.ai & never leaked in response", async () => {
   const calls: string[] = [];
   const tee: TeeMock = { urls: [], auths: [] };
   const r = await evaluateGenome(body(makeAuth()), okRpc(calls), CONTRACT, deps({}, tee));
@@ -189,7 +189,7 @@ test("jalur sukses: 200, bentuk spec, kunci hanya ke cloud-api.near.ai & tak boc
   assert.match(b["signatureHex"], /^[0-9a-f]{128}$/);
   assert.match(b["signingAddress"], /^[0-9a-f]{64}$/);
   assert.deepEqual(b["mutation"], { efficiency_shift_bps: 120, vitality_bonus: 30, phenotype_trait: "luminous" });
-  // VC-015: raw_response_body = byte respons enclave utuh (hash-nya = bagian terakhir signedText).
+  // VC-015: raw_response_body = exact enclave response bytes (its hash = last segment of signedText).
   assert.equal(typeof b["raw_response_body"], "string");
   assert.equal(createHash("sha256").update(b["raw_response_body"]).digest("hex"), b["signedText"].split(":")[2]);
   assert.equal(JSON.parse(b["raw_response_body"]).id, "chatcmpl-test-1");
@@ -197,15 +197,15 @@ test("jalur sukses: 200, bentuk spec, kunci hanya ke cloud-api.near.ai & tak boc
   assert.equal(rep.redaction_mode, "local_deterministic_sha256");
   assert.equal(rep.signature_verified, true);
   assert.match(rep.request_sha256_hex, /^[0-9a-f]{64}$/);
-  assert.ok(!rep.payload_terredaksi.includes("alice.testnet"), "akun harus tersensor");
-  assert.ok(!rep.payload_terredaksi.includes("Ignis-Spore: 3, Lumin-Spore: 2"), "takaran mentah harus tersembunyi");
+  assert.ok(!rep.payload_terredaksi.includes("alice.testnet"), "account must be redacted");
+  assert.ok(!rep.payload_terredaksi.includes("Ignis-Spore: 3, Lumin-Spore: 2"), "raw amounts must be hidden");
   assert.ok(!JSON.stringify(r.body).includes(API_KEY));
   assert.deepEqual(calls.sort(), ["get_strain", "view_access_key"]);
   assert.ok(tee.urls.length >= 2 && tee.urls.every((u) => u.startsWith("https://cloud-api.near.ai/")));
   assert.ok(tee.auths.includes(`Bearer ${API_KEY}`));
 });
 
-test("tanda tangan: dimodifikasi / kunci lain / recipient salah -> 401 invalid_signature", async () => {
+test("signature: tampered message / different key / wrong recipient -> 401 invalid_signature", async () => {
   const good = makeAuth();
   const tampered = { ...good, message: good.message.replace('"strain_id":5', '"strain_id":5 ') };
   assert.equal(err(await evaluateGenome(body(tampered), okRpc(), CONTRACT, deps())), "invalid_signature");
@@ -223,15 +223,15 @@ test("tanda tangan: dimodifikasi / kunci lain / recipient salah -> 401 invalid_s
   assert.equal(err(await evaluateGenome(body(junkSig), okRpc(), CONTRACT, deps())), "invalid_signature");
 });
 
-test("auth hilang / pesan salah bentuk / strain_id tak cocok / action salah", async () => {
+test("missing auth / malformed message / mismatched strain_id / wrong action", async () => {
   let r = await evaluateGenome(body(undefined), okRpc(), CONTRACT, deps());
   assert.deepEqual([r.status, err(r)], [401, "auth_required"]);
 
-  const bad = { ...makeAuth(), message: "bukan json" };
+  const bad = { ...makeAuth(), message: "not json" };
   r = await evaluateGenome(body(bad), okRpc(), CONTRACT, deps());
   assert.deepEqual([r.status, err(r)], [401, "invalid_message"]);
 
-  // tanda tangan sah atas strain 6, tetapi request meminta strain 5
+  // valid signature over strain 6, but request asks for strain 5
   r = await evaluateGenome(body(makeAuth({ strainId: 6 })), okRpc(), CONTRACT, deps());
   assert.deepEqual([r.status, err(r)], [401, "invalid_message"]);
 
@@ -244,7 +244,7 @@ test("auth hilang / pesan salah bentuk / strain_id tak cocok / action salah", as
   assert.deepEqual([r.status, err(r)], [400, "invalid_request"]);
 });
 
-test("kedaluwarsa 5 menit; masa depan > 60 dtk ditolak; tepat 5 menit masih lolos", async () => {
+test("5-minute expiry; future skew > 60s rejected; exact 5-minute boundary still passes", async () => {
   let r = await evaluateGenome(body(makeAuth({ ts: NOW - 5 * 60_000 - 1 })), okRpc(), CONTRACT, deps());
   assert.deepEqual([r.status, err(r)], [401, "signature_expired"]);
   r = await evaluateGenome(body(makeAuth({ ts: NOW + 61_000 })), okRpc(), CONTRACT, deps());
@@ -253,7 +253,7 @@ test("kedaluwarsa 5 menit; masa depan > 60 dtk ditolak; tepat 5 menit masih lolo
   assert.equal(r.status, 200);
 });
 
-test("nonce tidak boleh dipakai ulang (replay request identik)", async () => {
+test("nonce cannot be reused (identical request replay)", async () => {
   const d = deps();
   const auth = makeAuth();
   assert.equal((await evaluateGenome(body(auth), okRpc(), CONTRACT, d)).status, 200);
@@ -261,7 +261,7 @@ test("nonce tidak boleh dipakai ulang (replay request identik)", async () => {
   assert.deepEqual([r.status, err(r)], [401, "nonce_reused"]);
 });
 
-test("nonce: panjang salah ditolak; nonce dari tanda tangan palsu tidak ikut terbakar", async () => {
+test("nonce: wrong length rejected; nonce from a forged signature is not consumed", async () => {
   const short = { ...makeAuth(), nonce: randomBytes(16).toString("base64") };
   assert.equal(err(await evaluateGenome(body(short), okRpc(), CONTRACT, deps())), "invalid_nonce");
 
@@ -269,19 +269,19 @@ test("nonce: panjang salah ditolak; nonce dari tanda tangan palsu tidak ikut ter
   const nonce = randomBytes(32);
   const forged = { ...makeAuth({ nonce }), signature: Buffer.alloc(64, 2).toString("base64") };
   assert.equal(err(await evaluateGenome(body(forged), okRpc(), CONTRACT, d)), "invalid_signature");
-  // pemilik asli masih bisa memakai nonce yang sama (penyerang tak bisa membakarnya)
+  // genuine owner can still use the same nonce (attacker cannot burn it)
   assert.equal((await evaluateGenome(body(makeAuth({ nonce })), okRpc(), CONTRACT, d)).status, 200);
 });
 
-test("bukan pemilik strain -> 403 not_strain_owner (tanda tangan sah, kunci sah)", async () => {
+test("not strain owner -> 403 not_strain_owner (valid signature, valid key)", async () => {
   const tee: TeeMock = { urls: [], auths: [] };
   const rpc = mockRpc({ keyPermission: "FullAccess", strainOwner: "bob.testnet", calls: [] });
   const r = await evaluateGenome(body(makeAuth()), rpc, CONTRACT, deps({}, tee));
   assert.deepEqual([r.status, err(r)], [403, "not_strain_owner"]);
-  assert.equal(tee.urls.length, 0, "TEE tidak boleh dipanggil");
+  assert.equal(tee.urls.length, 0, "TEE must not be called");
 });
 
-test("kunci publik tidak milik akun -> 403 (dua gaya error RPC); FunctionCall key ditolak", async () => {
+test("public key not owned by account -> 403 (both RPC error styles); FunctionCall key rejected", async () => {
   for (const style of ["result", "jsonrpc"] as const) {
     const r = await evaluateGenome(
       body(makeAuth()),
@@ -296,12 +296,12 @@ test("kunci publik tidak milik akun -> 403 (dua gaya error RPC); FunctionCall ke
   assert.deepEqual([r.status, err(r)], [403, "public_key_not_full_access"]);
 });
 
-test("strain tidak ada -> 404", async () => {
+test("strain does not exist -> 404", async () => {
   const r = await evaluateGenome(body(makeAuth()), mockRpc({ keyPermission: "FullAccess", strainOwner: null, calls: [] }), CONTRACT, deps());
   assert.deepEqual([r.status, err(r)], [404, "strain_not_found"]);
 });
 
-test("rate limit 3/jam per strain -> 429 + Retry-After; pulih setelah 1 jam", async () => {
+test("rate limit 3/hour per strain -> 429 + Retry-After; recovers after 1 hour", async () => {
   let t = NOW;
   const d = deps({ now: () => t });
   const go = (ts = t) => evaluateGenome(body(makeAuth({ ts })), okRpc(), CONTRACT, d);
@@ -319,13 +319,13 @@ test("rate limit 3/jam per strain -> 429 + Retry-After; pulih setelah 1 jam", as
   assert.equal((await go()).status, 200);
 });
 
-test("rate limit: strain lain tidak terpengaruh; total 50/hari -> 429 scope global; pulih setelah 24 jam", () => {
+test("rate limit: other strains unaffected; 50/day total -> 429 global scope; recovers after 24 hours", () => {
   const l = new RateLimiter();
   for (let i = 0; i < 3; i++) assert.equal(l.take(1, NOW + i).ok, true);
   assert.equal(l.take(1, NOW + 10).ok, false);
   assert.equal(l.take(2, NOW + 10).ok, true);
-  // isi sampai batas harian: strain 3..N, 3/strain, tersebar >1 jam agar batas per-strain tak menghalangi
-  let n = 4; // sudah terpakai 3 + 1
+  // fill up to daily cap: strains 3..N, 3/strain, spread >1 hour so per-strain cap does not block
+  let n = 4; // 3 + 1 already used
   let strain = 3;
   let ts = NOW + 3_600_001;
   while (n < RATE_TOTAL_PER_DAY) {
@@ -339,7 +339,7 @@ test("rate limit: strain lain tidak terpengaruh; total 50/hari -> 429 scope glob
   assert.equal(l.take(9999, NOW + 86_400_000 + 3_600_002).ok, true);
 });
 
-test("TEE gagal -> 502 tanpa membocorkan kunci; mutasi di luar guardrail I-03 -> 502", async () => {
+test("TEE failure -> 502 without leaking key; mutation outside guardrail I-03 -> 502", async () => {
   const leak: TeeMock = {
     urls: [],
     auths: [],
@@ -356,12 +356,12 @@ test("TEE gagal -> 502 tanpa membocorkan kunci; mutasi di luar guardrail I-03 ->
   assert.deepEqual([r.status, err(r)], [502, "tee_guardrail_rejected"]);
 });
 
-test("RPC hulu gagal -> melempar RpcError (ditangkap route() jadi 503), bukan 403 palsu", async () => {
+test("upstream RPC failure -> throws RpcError (mapped to 503 by route()), not a false 403", async () => {
   const rpc = new NearRpcClient("http://rpc.test", (async () => new Response("x", { status: 500 })) as unknown as typeof fetch, 0);
   await assert.rejects(() => evaluateGenome(body(makeAuth()), rpc, CONTRACT, deps()), /HTTP 500/);
 });
 
-// ---- lewat route() dengan stream request nyata ----
+// ---- via route() with a real request stream ----
 function postReq(path: string, payload: string | Buffer, method = "POST"): IncomingMessage {
   const r = Readable.from([Buffer.from(payload)]) as unknown as IncomingMessage;
   (r as unknown as { url: string; method: string }).url = path;
@@ -369,18 +369,18 @@ function postReq(path: string, payload: string | Buffer, method = "POST"): Incom
   return r;
 }
 
-test("route: 405 bila bukan POST; 503 tanpa kunci; 400 JSON rusak; 413 body besar; 200 end-to-end", async () => {
+test("route: 405 when not POST; 503 without key; 400 malformed JSON; 413 oversized body; 200 end-to-end", async () => {
   const base = { rpc: okRpc(), contractId: CONTRACT, store: newStore() };
   let res = await route(postReq("/api/tee/evaluate-genome", "", "GET"), { ...base, evaluate: deps() });
   assert.equal(res.status, 405);
   assert.equal(res.headers?.["Allow"], "POST");
 
-  res = await route(postReq("/api/tee/evaluate-genome", "{}"), base); // tanpa deps.evaluate
+  res = await route(postReq("/api/tee/evaluate-genome", "{}"), base); // without deps.evaluate
   assert.deepEqual([res.status, res.body], [503, { error: "tee_not_configured" }]);
   res = await route(postReq("/api/tee/evaluate-genome", "{}"), { ...base, evaluate: deps({ apiKey: undefined }) });
   assert.deepEqual([res.status, res.body], [503, { error: "tee_not_configured" }]);
 
-  res = await route(postReq("/api/tee/evaluate-genome", "{bukan json"), { ...base, evaluate: deps() });
+  res = await route(postReq("/api/tee/evaluate-genome", "{not json"), { ...base, evaluate: deps() });
   assert.deepEqual([res.status, res.body], [400, { error: "invalid_json" }]);
 
   res = await route(postReq("/api/tee/evaluate-genome", Buffer.alloc(20_000, 0x20)), { ...base, evaluate: deps() });
@@ -391,7 +391,7 @@ test("route: 405 bila bukan POST; 503 tanpa kunci; 400 JSON rusak; 413 body besa
   assert.ok(!JSON.stringify(res.body).includes(API_KEY));
 });
 
-test("route: RpcError saat otorisasi dipetakan 503 rpc_unavailable", async () => {
+test("route: RpcError during authorization mapped to 503 rpc_unavailable", async () => {
   const rpc = new NearRpcClient("http://rpc.test", (async () => new Response("x", { status: 500 })) as unknown as typeof fetch, 0);
   const res = await route(postReq("/api/tee/evaluate-genome", JSON.stringify(body(makeAuth()))), {
     rpc,

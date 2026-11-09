@@ -1,14 +1,14 @@
 /**
- * `POST /api/tee/evaluate-genome` (VC-015): Tahap 1-3 spec (Dual-Layer Redaction -> NEAR AI Cloud TEE
- * `z-ai/glm-5.3-flash` -> `/v1/signature/{chat_id}`), dipagari karena memakai kunci NEAR AI milik server:
+ * `POST /api/tee/evaluate-genome` (VC-015): Spec Stages 1-3 (Dual-Layer Redaction -> NEAR AI Cloud TEE
+ * `z-ai/glm-5.3-flash` -> `/v1/signature/{chat_id}`), gated because it uses the server's NEAR AI key:
  *
- *  1. `NEAR_AI_API_KEY` hanya dari env server (disuntik `main.ts`); tidak pernah di-log atau dikembalikan.
- *  2. Hanya pemilik strain: pesan NEP-413 bertanda tangan, kunci publiknya FullAccess milik akun
- *     (`view_access_key`), dan akun itu = `owner_id` strain (`get_strain`).
- *  3. Pesan kedaluwarsa 5 menit; nonce sekali pakai.
- *  4. Rate limit 3/jam per strain dan 50/hari total (in-memory, hilang saat restart).
+ *  1. `NEAR_AI_API_KEY` comes strictly from the server env (injected in `main.ts`); never logged or returned.
+ *  2. Strain owner only: signed NEP-413 message whose public key is a FullAccess key on the account
+ *     (`view_access_key`), and that account equals the strain's `owner_id` (`get_strain`).
+ *  3. Message expires after 5 minutes; single-use nonce.
+ *  4. Rate limit of 3/hour per strain and 50/day total (in-memory, resets on restart).
  *
- * Logika redaksi/panggilan enclave dipakai ulang dari `./oracle/*` (salinan `oracle-tee`, lihat SYNC.md).
+ * Redaction/enclave call logic is reused from `./oracle/*` (vendored copy of `oracle-tee`, see SYNC.md).
  */
 
 import { NearRpcClient } from "./near.js";
@@ -19,12 +19,12 @@ import { runGenomeRedactionPipeline } from "./oracle/pipeline.js";
 import { runGenomeExperiment } from "./oracle/enclave-client.js";
 import type { FetchLike } from "./tee.js";
 
-/** Recipient NEP-413 yang wajib dipakai penanda tangan (pemisah domain; bukan rahasia). */
+/** NEP-413 recipient required from the signer (domain separator; not a secret). */
 export const EVALUATE_RECIPIENT = "snacc-backend";
-/** Nilai `action` wajib di dalam `message` JSON. */
+/** Required `action` value inside the JSON `message`. */
 export const EVALUATE_ACTION = "evaluate-genome";
 export const SIGNATURE_MAX_AGE_MS = 5 * 60_000;
-/** Toleransi jam klien yang sedikit di depan server. */
+/** Tolerance for client clocks running slightly ahead of the server. */
 export const SIGNATURE_FUTURE_SKEW_MS = 60_000;
 export const RATE_PER_STRAIN_PER_HOUR = 3;
 export const RATE_TOTAL_PER_DAY = 50;
@@ -41,7 +41,7 @@ export interface EvaluateResult {
   headers?: Record<string, string>;
 }
 
-/** Nonce terpakai; entri dibuang setelah melewati masa berlaku pesan (tak mungkin dipakai lagi). */
+/** Used nonces; entries are evicted once past the message validity window (cannot be replayed anyway). */
 export class NonceStore {
   private readonly used = new Map<string, number>();
   has(nonceHex: string): boolean {
@@ -57,7 +57,7 @@ export class NonceStore {
 
 export type RateDecision = { ok: true } | { ok: false; scope: "strain" | "global"; retryAfterSec: number };
 
-/** Jendela geser: 3/jam per strain, 50/hari total. `take` mencatat hanya bila lolos kedua batas. */
+/** Sliding window: 3/hour per strain, 50/day total. `take` records the hit only if both limits pass. */
 export class RateLimiter {
   private readonly perStrain = new Map<number, number[]>();
   private total: number[] = [];
@@ -81,7 +81,7 @@ export class RateLimiter {
 }
 
 export interface EvaluateDeps {
-  /** `NEAR_AI_API_KEY` dari env server; kosong -> 503 `tee_not_configured`. */
+  /** `NEAR_AI_API_KEY` from server env; empty -> 503 `tee_not_configured`. */
   apiKey?: string;
   fetchFn?: FetchLike;
   now?: () => number;
@@ -137,7 +137,7 @@ function parseBody(
   return { strainId, payloadText, rawFormula, auth: auth as unknown as ParsedAuth };
 }
 
-/** Autentikasi + otorisasi pemilik. Mengembalikan `null` bila lolos, selain itu respons penolakan. */
+/** Authenticate + authorize strain owner. Returns `null` on success, or a rejection response. */
 async function authorizeOwner(
   strainId: number,
   auth: ParsedAuth,
@@ -148,7 +148,7 @@ async function authorizeOwner(
 ): Promise<EvaluateResult | null> {
   if (!isValidAccountId(auth.account_id)) return fail(400, "invalid_account_id");
 
-  // message = JSON {action, strain_id, timestamp(ms)} yang mengikat tanda tangan ke strain ini.
+  // message = JSON {action, strain_id, timestamp(ms)} binding the signature to this strain.
   let msg: unknown;
   try {
     msg = JSON.parse(auth.message);
@@ -178,10 +178,10 @@ async function authorizeOwner(
   if (!sig || !verifyNep413(auth.public_key, { message: auth.message, nonce, recipient: EVALUATE_RECIPIENT }, sig)) {
     return fail(401, "invalid_signature");
   }
-  // Tanda tangan sah: kunci nonce SEKARANG (sinkron, sebelum await) agar request paralel tak lolos ganda.
+  // Valid signature: consume the nonce NOW (synchronously, before await) so parallel requests cannot double-pass.
   deps.nonces.consume(nonceHex, now);
 
-  // Kunci publik harus milik akun dan FullAccess (kunci FunctionCall bisa dipegang dApp lain).
+  // Public key must belong to the account and be FullAccess (FunctionCall keys may be held by third-party dApps).
   const key = await rpc.viewAccessKey(auth.account_id, auth.public_key);
   if (!key) return fail(403, "public_key_not_owned");
   if (key.permission !== "FullAccess") return fail(403, "public_key_not_full_access");
@@ -238,8 +238,8 @@ export async function evaluateGenome(
         signedText: exp.signedText,
         signatureHex: exp.signatureHex,
         signingAddress: exp.signingAddress,
-        // Byte respons enclave persis seperti diterima — wajib utuh untuk
-        // `apply_tee_mutation_zero_trust` (kontrak menghitung ulang sha256-nya).
+        // Exact raw enclave response bytes as received — must remain intact for
+        // `apply_tee_mutation_zero_trust` (the contract recomputes its sha256).
         raw_response_body: exp.rawResponse,
         mutation: exp.mutation,
         redactionReport: {
