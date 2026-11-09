@@ -30,6 +30,14 @@ export function isValidAccountId(id: string): boolean {
 interface ViewOut {
   text: string;
   block_height: number;
+  /** Present when the result was served stale from the cache (all endpoints failing). */
+  staleSeconds?: number;
+}
+
+/** Combine per-view staleness: the oldest part decides the header value. */
+function maxStaleSeconds(parts: Array<number | undefined>): number | undefined {
+  const present = parts.filter((p): p is number => typeof p === "number");
+  return present.length > 0 ? Math.max(...present) : undefined;
 }
 
 async function view(
@@ -43,7 +51,7 @@ async function view(
     method,
     Buffer.from(JSON.stringify(args)).toString("base64"),
   );
-  return { text: r.text, block_height: r.block_height };
+  return { text: r.text, block_height: r.block_height, staleSeconds: r.staleSeconds };
 }
 
 /** Wrap view call: missing contract account -> `contract_not_deployed`. */
@@ -69,6 +77,8 @@ export interface StrainListResponse {
   truncated: boolean;
   source: string;
   contractId: string;
+  /** Present (and exposed as the `x-data-stale-seconds` header) when served stale. */
+  staleSeconds?: number;
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {
@@ -104,13 +114,18 @@ export async function fetchStrainList(
     const views = await mapLimit(ids, FETCH_CONCURRENCY, async (id) => {
       try {
         const r = await view(client, contractId, "get_strain", { strain_id: id });
-        return JSON.parse(quoteU128Fields(r.text, STRAIN_U128_FIELDS)) as StrainVesselView;
+        return {
+          view: JSON.parse(quoteU128Fields(r.text, STRAIN_U128_FIELDS)) as StrainVesselView,
+          staleSeconds: r.staleSeconds,
+        };
       } catch (err) {
         if (err instanceof ViewPanicError) return null; // ID does not exist (sequence gap)
         throw err;
       }
     });
-    const strains = views.filter((v): v is StrainVesselView => v !== null);
+    const strains = views
+      .filter((v): v is { view: StrainVesselView; staleSeconds: number } => v !== null)
+      .map((v) => v.view);
     return {
       strains,
       starvingCount: strains.filter((s) => s.status === "Distressed").length,
@@ -120,6 +135,10 @@ export async function fetchStrainList(
       truncated: total > n,
       source: "view:nft_total_supply+get_strain",
       contractId,
+      staleSeconds: maxStaleSeconds([
+        supply.staleSeconds,
+        ...views.map((v) => (v ? v.staleSeconds : undefined)),
+      ]),
     };
   });
 }
@@ -197,6 +216,8 @@ export interface DividendsResponse {
   contribution?: { epoch: number; strain_id: number; amount: string; claimed: boolean };
   contractId: string;
   blockHeight: number;
+  /** Present (and exposed as the `x-data-stale-seconds` header) when served stale. */
+  staleSeconds?: number;
 }
 
 export async function fetchDividends(
@@ -212,15 +233,16 @@ export async function fetchDividends(
     for (let e = from; e <= lastClosed; e++) epochs.push(e);
     const rates = await mapLimit(epochs, FETCH_CONCURRENCY, async (epoch) => {
       const r = await view(client, contractId, "get_epoch_dividend_rate", { epoch });
-      return { epoch, rate: String(JSON.parse(r.text) as string) };
+      return { epoch, rate: String(JSON.parse(r.text) as string), staleSeconds: r.staleSeconds };
     });
     const out: DividendsResponse = {
       industrial_dividend_pool: String(poolAmt),
       epoch_dividend_inflow: String(inflow),
       last_closed_epoch: lastClosed,
-      epoch_dividend_rate: rates,
+      epoch_dividend_rate: rates.map(({ epoch, rate }) => ({ epoch, rate })),
       contractId,
       blockHeight: pool.block_height,
+      staleSeconds: maxStaleSeconds([pool.staleSeconds, ...rates.map((r) => r.staleSeconds)]),
     };
     if (contribution) {
       const c = await view(client, contractId, "get_dividend_contribution", contribution);
@@ -300,6 +322,8 @@ export interface ZonesResponse {
   history_note: string;
   contractId: string;
   blockHeight: number;
+  /** Present (and exposed as the `x-data-stale-seconds` header) when served stale. */
+  staleSeconds?: number;
 }
 
 /**
@@ -359,6 +383,7 @@ export async function fetchZones(
         "zone_changed history only includes events captured by the poller since process start; the contract does not expose a zone history view.",
       contractId,
       blockHeight: meter.block_height,
+      staleSeconds: maxStaleSeconds([meter.staleSeconds, macro.staleSeconds]),
     };
   });
 }

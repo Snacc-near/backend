@@ -16,6 +16,8 @@ export interface CrucibleMacroResponse {
   history: unknown[];
   contractId: string;
   blockHeight: number;
+  /** Present (and exposed as the `x-data-stale-seconds` header) when served stale. */
+  staleSeconds?: number;
 }
 
 export interface StrainVesselView {
@@ -62,10 +64,12 @@ export async function fetchMacroState(
   const args = Buffer.from(JSON.stringify({})).toString("base64");
   let text: string;
   let blockHeight: number;
+  let staleSeconds: number | undefined;
   try {
     const r = await client.viewFunction(contractId, "get_macro_state", args);
     text = r.text;
     blockHeight = r.block_height;
+    staleSeconds = r.staleSeconds;
   } catch (err) {
     if (isContractNotDeployed(err)) return { error: "contract_not_deployed" };
     throw err;
@@ -82,6 +86,7 @@ export async function fetchMacroState(
     history: [],
     contractId,
     blockHeight,
+    ...(staleSeconds !== undefined ? { staleSeconds } : {}),
   };
 }
 

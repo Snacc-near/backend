@@ -9,7 +9,7 @@ Pure Node.js + TypeScript (`node:http`, 0 runtime dependencies). The contract is
 ```bash
 npm install
 npm test                      # unit tests (RPC + NEAR AI Cloud stubbed, no network needed)
-CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (default RPC https://test.rpc.fastnear.com; override via RPC_URL)
+CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (default RPC pool: drpc → fastnear → intear → near.org; override via RPC_URLS/RPC_URL)
 ```
 
 | Endpoint | Status |
@@ -24,7 +24,20 @@ CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (default RPC https://test.rpc
 | `GET /api/zones` | 🟡 current zone is live (`get_appetite_meter` + `get_macro_state`); `zone_changed` history comes only from the in-memory event cache and is marked `history_complete:false` (the contract has no zone history view) |
 | `GET /api/tee/attestation-report` | ✅ live: public proxy for `cloud-api.near.ai/v1/attestation/report` (60s cache) → `{model, signingAddress, gatewayAttestation, modelAttestations}` |
 | `GET /api/events` | 🟡 live poller v2 (`src/poller.ts`): tx discovery via the NearBlocks v3 account feed (1 call/tick, no key) + `EVENT_JSON` from the `tx` RPC (≤5 new txs/tick); `indexer_incomplete:false` only while the source is healthy and the backfill queue is drained, `true` during failures/backoff; lag in the `x-indexer-lag-blocks` response header |
+| `GET /api/health` | ✅ liveness + RPC pool snapshot (INT-rpc-fallback): `{ok, contractId, rpc:{currentHost, endpoints:[{host, cooldownUntil, cooldownSeconds, failures}], cache:{hits, misses, staleServed, size}}, indexer_incomplete}` — hosts only, no secrets |
 | `POST /api/tee/evaluate-genome` | ✅ (`VC-015`) Stages 1–3 live, gated — see section below. Without `NEAR_AI_API_KEY` in the server env → `503 {error:"tee_not_configured"}` (public backend intentionally runs without a key) |
+
+### Environment (`INT-rpc-fallback`)
+
+Public testnet RPCs rate-limit per source IP (observed: HTTP 429 on `fastnear`/`near.org` from the server IP), so the client treats RPC as an **ordered pool**: on 429/5xx/timeout/network error it rotates to the next endpoint with exponential backoff + jitter, remembers the last healthy endpoint, and cools a 429'd endpoint down (exponential; a server `Retry-After` is honored). Contract views (`call_function`) are cached briefly (default 10 s, in-flight de-duplicated); while every endpoint fails, a cached view up to 120 s old is served stale with an `x-data-stale-seconds` header — never fabricated data. Errors are never cached as data.
+
+| Env | Default | Purpose |
+| --- | :-: | --- |
+| `RPC_URLS` | `https://near-testnet.drpc.org,https://test.rpc.fastnear.com,https://testnet-rpc.intea.rs,https://rpc.testnet.near.org` | Ordered pool of public testnet RPCs (from the official NEAR provider list `docs.near.org/api/rpc/providers`) |
+| `RPC_URL` | — | Legacy single-endpoint override (used as a one-item pool when `RPC_URLS` is unset) |
+| `VIEW_CACHE_TTL_MS` | `10000` | Fresh-serve window for cached contract views |
+| `VIEW_STALE_TTL_MS` | `120000` | Oldest cached view still served (labelled stale) while all endpoints fail |
+| `RPC_COOLDOWN_BASE_MS` | `60000` | Base per-endpoint cooldown after a 429 (doubles per consecutive 429, cap 10 min) |
 
 ### `POST /api/tee/evaluate-genome` (VC-015)
 
