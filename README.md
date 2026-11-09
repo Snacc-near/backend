@@ -23,7 +23,7 @@ CONTRACT_ID=snacc-v001.testnet npm start   # :8787 (default RPC https://test.rpc
 | `GET /api/appetite` | ✅ live: `get_appetite_meter` + `get_top_feeder` (current epoch) |
 | `GET /api/zones` | 🟡 current zone is live (`get_appetite_meter` + `get_macro_state`); `zone_changed` history comes only from the in-memory event cache and is marked `history_complete:false` (the contract has no zone history view) |
 | `GET /api/tee/attestation-report` | ✅ live: public proxy for `cloud-api.near.ai/v1/attestation/report` (60s cache) → `{model, signingAddress, gatewayAttestation, modelAttestations}` |
-| `GET /api/events` | 🔴 poller non-functional — see note below; always returns `indexer_incomplete:true` |
+| `GET /api/events` | 🟡 live poller (`src/poller.ts`): contract txs discovered block-by-block via the public RPC, `EVENT_JSON` absorbed from `tx` outcomes; `indexer_incomplete:false` while the cursor is at the head, `true` during failures/gaps; lag in the `x-indexer-lag-blocks` response header |
 | `POST /api/tee/evaluate-genome` | ✅ (`VC-015`) Stages 1–3 live, gated — see section below. Without `NEAR_AI_API_KEY` in the server env → `503 {error:"tee_not_configured"}` (public backend intentionally runs without a key) |
 
 ### `POST /api/tee/evaluate-genome` (VC-015)
@@ -72,6 +72,6 @@ The redaction logic + enclave client in `src/oracle/` is a versioned copy from t
 
 Principle: **never fabricate data** — unimplemented endpoints respond `501 {error:"not_implemented", todo:"<ID>"}`; undeployed contract → `503 {error:"contract_not_deployed"}`; upstream RPC failure/rejection (e.g. 429 after 3 retries) → `503 {error:"rpc_unavailable"}`. `u128` fields and large `u64` sentinels (`atp_balance`, `feast_volume`, `last_allocate_epoch`, …) are always exact **strings**.
 
-**Event poller note (`INT-102` follow-up, not yet complete):** RPC `chunk` does not carry execution logs (only raw receipts) and `block.header.chunk_ids` does not exist (the field is `block.chunks[]`), so the poller never captures events. A complete indexer requires `EXPERIMENTAL_tx_status` per contract transaction or an external indexer. Therefore the strain list is now read from contract views rather than events.
+**Event poller note (INT-102, implemented in `src/poller.ts`):** RPC `chunk` does not carry execution logs (receipt `outcome` is empty by definition — receipts execute later), and `block.header.chunk_ids` does not exist (the field is `block.chunks[]` with `chunk_hash`). The poller therefore follows the recorded decision (`docs/indexer-decision.md`, option E): discover the contract's transactions per block (`chunk.transactions` filtered by `receiver_id === CONTRACT_ID`) and read each tx's full outcome tree from the `tx` RPC (`transaction_outcome` + `receipts_outcome`), which includes the cross-contract callback receipts. Delayed callbacks are covered by one recheck pass per tx on the following tick; receipt-level dedupe prevents double absorption. Bounds: catch-up ≤ 50 blocks/tick, ≤ 5000 events in memory (oldest evicted, counted in `droppedEvents`). The strain list still comes from contract views (events only feed `/api/events` and the `zone_changed` history).
 
 Spec: `snacc-vault/` · JSON schemas: [`docs/api-schemas.md`](../docs/api-schemas.md) in the umbrella repo.

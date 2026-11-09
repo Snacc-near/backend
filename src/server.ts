@@ -9,6 +9,7 @@ import { IncomingMessage } from "node:http";
 import { NearRpcClient, RpcError } from "./near.js";
 import { fetchMacroState, fetchStrain } from "./macro.js";
 import { EventStore, newEventStore } from "./events.js";
+import { indexerLagBlocks, type PollerState } from "./poller.js";
 import {
   fetchAppetite,
   fetchColony,
@@ -29,6 +30,8 @@ export interface RouterDeps {
   fetchFn?: FetchLike;
   /** Gate for `POST /api/tee/evaluate-genome` (VC-015); without this, the endpoint returns 503 `tee_not_configured`. */
   evaluate?: EvaluateDeps;
+  /** Poller cursor state (INT-102); when absent, /api/events reports the store as-is (indexer_incomplete). */
+  poller?: PollerState;
 }
 
 export interface RouterResult {
@@ -175,6 +178,8 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
   }
 
   if (pathname === "/api/events") {
+    // The spec does not define a lag body field, so the lag goes in a response header only.
+    const lag = deps.poller ? indexerLagBlocks(deps.poller) : null;
     return {
       status: 200,
       body: {
@@ -182,6 +187,7 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
         indexer_incomplete: !deps.store.indexerComplete,
         contractId,
       },
+      headers: lag === null ? undefined : { "x-indexer-lag-blocks": String(lag) },
     };
   }
 

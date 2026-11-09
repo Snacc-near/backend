@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { route, newStore } from "../src/server.js";
+import { newPollerState } from "../src/poller.js";
 import { NearRpcClient } from "../src/near.js";
 import type { IncomingMessage } from "node:http";
 
@@ -78,6 +79,29 @@ test("route: /api/events still flags indexer_incomplete", async () => {
   });
   assert.equal(res.status, 200);
   assert.equal((res.body as { indexer_incomplete: boolean }).indexer_incomplete, true);
+  assert.equal(res.headers?.["x-indexer-lag-blocks"], undefined); // no poller state -> no lag header
+});
+
+test("route: /api/events exposes the measured lag as a response header (not a body field)", async () => {
+  const store = newStore();
+  store.indexerComplete = true;
+  const res = await route(fakeReq("/api/events"), {
+    rpc: clientWithResult({}),
+    contractId: "c.near",
+    store,
+    poller: { ...newPollerState(), cursorHeight: 90, headHeight: 97, caughtUp: false },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers?.["x-indexer-lag-blocks"], "7");
+  assert.equal((res.body as { indexer_incomplete: boolean }).indexer_incomplete, false);
+  // A cursor that has reached the head reports lag 0.
+  const res2 = await route(fakeReq("/api/events"), {
+    rpc: clientWithResult({}),
+    contractId: "c.near",
+    store,
+    poller: { ...newPollerState(), cursorHeight: 97, headHeight: 97, caughtUp: true },
+  });
+  assert.equal(res2.headers?.["x-indexer-lag-blocks"], "0");
 });
 
 test("route: /api/strains/:id 404 strain_not_found", async () => {

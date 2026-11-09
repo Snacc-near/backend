@@ -53,3 +53,33 @@ test("isContractNotDeployed recognizes UNKNOWN_ACCOUNT & ContractCodeNotFound", 
   assert.equal(isContractNotDeployed(other), false);
   assert.equal(isContractNotDeployed(new Error("plain")), false);
 });
+
+test("HTTP 429 is retried with backoff, then succeeds", async () => {
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls++;
+    if (calls <= 2) return new Response("rate limited", { status: 429 });
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: "x", result: VIEW_RESULT }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  const client = new NearRpcClient("http://rpc.test", fetchFn, 0); // retryDelayMs = 0 for tests
+  const r = await client.viewFunction("c.near", "get_macro_state", "e30=");
+  assert.equal(r.block_height, 12345);
+  assert.equal(calls, 3);
+});
+
+test("persistent HTTP 429 exhausts the retries and throws RpcError", async () => {
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls++;
+    return new Response("rate limited", { status: 429 });
+  }) as unknown as typeof fetch;
+  const client = new NearRpcClient("http://rpc.test", fetchFn, 0);
+  await assert.rejects(
+    () => client.viewFunction("c.near", "get_macro_state", "e30="),
+    (err: unknown) => err instanceof RpcError && /429/.test(err.message),
+  );
+  assert.equal(calls, 4); // 1 initial + RETRY_ATTEMPTS (3)
+});

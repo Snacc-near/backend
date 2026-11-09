@@ -57,15 +57,24 @@ export interface EventStore {
   events: CrucibleEvent[];
   strainsSeen: Map<number, { owner_id: string }>;
   indexerComplete: boolean;
+  /** Events dropped by the memory cap (`MAX_EVENTS`); oldest are evicted first. */
+  droppedEvents: number;
 }
 
+/** In-memory cap: drop the oldest events beyond this (INT-102 memory bound). */
+export const MAX_EVENTS = 5000;
+
 export function newEventStore(): EventStore {
-  return { events: [], strainsSeen: new Map(), indexerComplete: false };
+  return { events: [], strainsSeen: new Map(), indexerComplete: false, droppedEvents: 0 };
 }
 
 /** Store an event in memory; record strain_created for /api/strains fallback tracking. */
 export function absorbEvent(store: EventStore, ev: CrucibleEvent): void {
   store.events.push(ev);
+  while (store.events.length > MAX_EVENTS) {
+    store.events.shift();
+    store.droppedEvents += 1;
+  }
   if (ev.kind === "strain_created") {
     const sid = Number(ev.raw["strain_id"]);
     if (Number.isInteger(sid)) {

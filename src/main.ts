@@ -6,7 +6,7 @@
 import { createServer } from "node:http";
 import { NearRpcClient } from "./near.js";
 import { route, newStore } from "./server.js";
-import { collectEventsFromChunk, absorbEvent } from "./events.js";
+import { pollOnce, newPollerState, indexerLagBlocks } from "./poller.js";
 import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
@@ -16,11 +16,12 @@ const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 15000);
 
 const rpc = new NearRpcClient(RPC_URL);
 const store = newStore();
+const pollerState = newPollerState();
 // VC-015: NEAR AI key comes strictly from server env; never logged or returned. Empty -> 503 tee_not_configured.
 const evaluateDeps: EvaluateDeps = { apiKey: process.env["NEAR_AI_API_KEY"] || undefined, ...newEvaluateState() };
 
 const server = createServer((req, res) => {
-  route(req, { rpc, contractId: CONTRACT_ID, store, evaluate: evaluateDeps })
+  route(req, { rpc, contractId: CONTRACT_ID, store, evaluate: evaluateDeps, poller: pollerState })
     .then((r) => {
       res.writeHead(r.status, {
         "Content-Type": r.contentType ?? "application/json",
@@ -38,17 +39,18 @@ server.listen(PORT, () => {
   console.log(`snacc-backend listening on :${PORT}, contract=${CONTRACT_ID}, rpc=${RPC_URL}`);
 });
 
-// Simple poller: fetch the latest chunks from the latest final block (INT-104; full
-// per-block-range indexer is deferred to INT-102 follow-up — see README note).
+// Event poller (INT-102/INT-104): block → chunks → receipt logs via the public RPC, with a
+// per-block cursor, catch-up bounded per tick, 429 backoff in NearRpcClient, and a bounded
+// in-memory store. Path E of docs/indexer-decision.md. Lag is logged every tick and exposed
+// on /api/events as the `x-indexer-lag-blocks` response header (no new body field — the spec
+// does not define one).
 const timer = setInterval(async () => {
   try {
-    const block = await rpc.fetchJsonRpc<{ header: { chunk_ids: string[] } }>("block", {
-      finality: "final",
-    });
-    for (const chunkId of block.header.chunk_ids) {
-      const chunk = await rpc.chunk(chunkId);
-      for (const ev of collectEventsFromChunk(chunk)) absorbEvent(store, ev);
-    }
+    await pollOnce(rpc, CONTRACT_ID, store, pollerState);
+    const lag = indexerLagBlocks(pollerState);
+    console.log(
+      `poller: head=${pollerState.headHeight} cursor=${pollerState.cursorHeight} lag=${lag} events=${store.events.length} dropped=${store.droppedEvents}`,
+    );
   } catch (err) {
     console.error("poller:", String(err));
   }
