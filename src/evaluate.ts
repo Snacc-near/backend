@@ -238,6 +238,9 @@ export async function evaluateGenome(
         signedText: exp.signedText,
         signatureHex: exp.signatureHex,
         signingAddress: exp.signingAddress,
+        // Byte respons enclave persis seperti diterima — wajib utuh untuk
+        // `apply_tee_mutation_zero_trust` (kontrak menghitung ulang sha256-nya).
+        raw_response_body: exp.rawResponse,
         mutation: exp.mutation,
         redactionReport: {
           redaction_mode: pipeline.redaction_mode,

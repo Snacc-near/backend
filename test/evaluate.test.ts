@@ -189,6 +189,10 @@ test("jalur sukses: 200, bentuk spec, kunci hanya ke cloud-api.near.ai & tak boc
   assert.match(b["signatureHex"], /^[0-9a-f]{128}$/);
   assert.match(b["signingAddress"], /^[0-9a-f]{64}$/);
   assert.deepEqual(b["mutation"], { efficiency_shift_bps: 120, vitality_bonus: 30, phenotype_trait: "luminous" });
+  // VC-015: raw_response_body = byte respons enclave utuh (hash-nya = bagian terakhir signedText).
+  assert.equal(typeof b["raw_response_body"], "string");
+  assert.equal(createHash("sha256").update(b["raw_response_body"]).digest("hex"), b["signedText"].split(":")[2]);
+  assert.equal(JSON.parse(b["raw_response_body"]).id, "chatcmpl-test-1");
   const rep = b["redactionReport"];
   assert.equal(rep.redaction_mode, "local_deterministic_sha256");
   assert.equal(rep.signature_verified, true);
