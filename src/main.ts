@@ -5,7 +5,7 @@
 
 import { createServer } from "node:http";
 import { NearRpcClient } from "./near.js";
-import { route, newStore } from "./server.js";
+import { route, newStore, corsHeaders } from "./server.js";
 import { pollTick, newPollerState } from "./poller.js";
 import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
@@ -25,6 +25,7 @@ const server = createServer((req, res) => {
     .then((r) => {
       res.writeHead(r.status, {
         "Content-Type": r.contentType ?? "application/json",
+        ...corsHeaders(req.method),
         ...r.headers,
       });
       res.end(r.contentType ? r.body : JSON.stringify(r.body));

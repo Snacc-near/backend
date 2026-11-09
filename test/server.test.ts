@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { route, newStore } from "../src/server.js";
+import { route, newStore, corsHeaders } from "../src/server.js";
 import { newPollerState } from "../src/poller.js";
 import { NearRpcClient } from "../src/near.js";
 import type { IncomingMessage } from "node:http";
@@ -149,4 +149,15 @@ test("end-to-end HTTP server on port 0", async () => {
   assert.equal(res.status, 503);
   assert.deepEqual(await res.json(), { error: "contract_not_deployed" });
   srv.close();
+});
+
+test("CORS: GET/HEAD are readable cross-origin; POST (evaluate-genome) gets no CORS headers", () => {
+  assert.deepEqual(corsHeaders("GET"), {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "x-indexer-lag-blocks",
+  });
+  assert.equal(corsHeaders("HEAD")["Access-Control-Allow-Origin"], "*");
+  assert.deepEqual(corsHeaders("POST"), {});
+  assert.deepEqual(corsHeaders("OPTIONS"), {});
+  assert.deepEqual(corsHeaders(undefined), {});
 });

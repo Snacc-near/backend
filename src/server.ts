@@ -71,6 +71,20 @@ function intParam(v: string | null): number | undefined {
 }
 
 /** Upstream RPC failure (429 exhausted retries, 5xx, etc.) -> honest 503, not internal 500. */
+/**
+ * CORS for the public read-only API (UI-117..126 frontend is hosted on another origin): GET/HEAD
+ * responses carry `Access-Control-Allow-Origin: *` (and expose the indexer lag header). Other
+ * methods get no CORS headers, so `POST /api/tee/evaluate-genome` stays non-callable from browsers
+ * on other origins (no preflight is answered).
+ */
+export function corsHeaders(method: string | undefined): Record<string, string> {
+  if (method !== "GET" && method !== "HEAD") return {};
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "x-indexer-lag-blocks",
+  };
+}
+
 export async function route(req: IncomingMessage, deps: RouterDeps): Promise<RouterResult> {
   try {
     return await routeInner(req, deps);
