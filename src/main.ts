@@ -6,7 +6,7 @@
 import { createServer } from "node:http";
 import { NearRpcClient } from "./near.js";
 import { route, newStore } from "./server.js";
-import { pollOnce, newPollerState, indexerLagBlocks } from "./poller.js";
+import { pollOnce, newPollerState } from "./poller.js";
 import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
@@ -39,17 +39,20 @@ server.listen(PORT, () => {
   console.log(`snacc-backend listening on :${PORT}, contract=${CONTRACT_ID}, rpc=${RPC_URL}`);
 });
 
-// Event poller (INT-102/INT-104): block → chunks → receipt logs via the public RPC, with a
-// per-block cursor, catch-up bounded per tick, 429 backoff in NearRpcClient, and a bounded
-// in-memory store. Path E of docs/indexer-decision.md. Lag is logged every tick and exposed
-// on /api/events as the `x-indexer-lag-blocks` response header (no new body field — the spec
-// does not define one).
+// Event poller v2 (INT-102/INT-104): discovery via the NearBlocks v3 account feed (1 call per
+// tick, no key), event logs via the NEAR `tx` RPC per new contract tx (budget 5/tick), and a
+// global exponential backoff on 429/5xx (backing-off ticks make NO API calls, so the other view
+// endpoints keep their RPC budget). Lag is logged every tick and exposed on /api/events as the
+// `x-indexer-lag-blocks` response header (no new body field — the spec does not define one).
+const discoveryFetch = (async (url: string) => {
+  const res = await fetch(url);
+  return { ok: res.ok, status: res.status, json: () => res.json() };
+}) as import("./poller.js").DiscoveryFetch;
 const timer = setInterval(async () => {
   try {
-    await pollOnce(rpc, CONTRACT_ID, store, pollerState);
-    const lag = indexerLagBlocks(pollerState);
+    await pollOnce(rpc, discoveryFetch, CONTRACT_ID, store, pollerState);
     console.log(
-      `poller: head=${pollerState.headHeight} cursor=${pollerState.cursorHeight} lag=${lag} events=${store.events.length} dropped=${store.droppedEvents}`,
+      `poller: head=${pollerState.headHeight} cursor=${pollerState.cursorHeight} lag=${pollerState.lagBlocks} events=${store.events.length} dropped=${store.droppedEvents} queue=${pollerState.queue.length} 429s=${pollerState.rateLimitedErrors} backoffTicks=${pollerState.backedOffTicks}`,
     );
   } catch (err) {
     console.error("poller:", String(err));

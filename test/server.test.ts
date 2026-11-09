@@ -89,7 +89,7 @@ test("route: /api/events exposes the measured lag as a response header (not a bo
     rpc: clientWithResult({}),
     contractId: "c.near",
     store,
-    poller: { ...newPollerState(), cursorHeight: 90, headHeight: 97, caughtUp: false },
+    poller: { ...newPollerState(), cursorHeight: 90, headHeight: 97, lagBlocks: 7, caughtUp: false },
   });
   assert.equal(res.status, 200);
   assert.equal(res.headers?.["x-indexer-lag-blocks"], "7");
@@ -99,7 +99,7 @@ test("route: /api/events exposes the measured lag as a response header (not a bo
     rpc: clientWithResult({}),
     contractId: "c.near",
     store,
-    poller: { ...newPollerState(), cursorHeight: 97, headHeight: 97, caughtUp: true },
+    poller: { ...newPollerState(), cursorHeight: 97, headHeight: 97, lagBlocks: 0, caughtUp: true },
   });
   assert.equal(res2.headers?.["x-indexer-lag-blocks"], "0");
 });

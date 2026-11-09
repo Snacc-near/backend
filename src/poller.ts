@@ -1,99 +1,126 @@
 /**
- * NEP-297 event poller (INT-102/INT-104). The recorded decision (`docs/indexer-decision.md`,
- * option E): read `EVENT_JSON` from the `tx` execution outcome via the public JSON-RPC
- * (0 API keys). Per tick: discover the contract's transactions block by block
- * (block → chunks → chunk.transactions filtered by `receiver_id === contractId`), fetch each
- * transaction's full outcome tree (`tx` = transaction_outcome + receipts_outcome), and absorb
- * every NEP-297 event into the in-memory store.
+ * NEP-297 event poller v2 (INT-102/INT-104). Budget-friendly redesign of the block scanner:
+ * the previous version fetched every block × every chunk on the free public RPC (≈10+ calls
+ * per block) and exhausted its 429 quota within a minute of live deployment. The recorded
+ * decision (`docs/indexer-decision.md`, option E) stays: parse `EVENT_JSON` from `tx` outcomes.
+ * What changes is the DISCOVERY source:
  *
- * - Per-block cursor: every fully processed block advances `cursorHeight`; a tick processes at
- *   most `MAX_BLOCKS_PER_TICK` blocks so catch-up is bounded.
- * - Callback events (e.g. `subaccount_materialized` from a cross-contract promise) can execute in
- *   a later block than the triggering tx; each tx is therefore re-queried on the next tick
- *   (`recheck`, one extra pass) before being considered final.
- * - 429/502/503/504 retry + exponential backoff live in `NearRpcClient`; when retries are
- *   exhausted, `pollOnce` records `lastError` and keeps the cursor (no data loss, no skip).
- * - Memory bounds: the event store caps retained events (`MAX_EVENTS`); the seen-receipt and
- *   recheck sets are pruned to bounded sizes.
+ * - Discovery = the NearBlocks v3 API (`GET {discoveryUrl}` = `/v3/accounts/<contract>/txns`,
+ *   no API key, newest-first). ONE discovery call per poll tick (≈4/min at the 15 s interval —
+ *   empirically the unauthenticated limit allows a burst of ~4 requests and recovers in ~12 s).
+ * - Logs = the plain NEAR RPC `tx` per NEW contract transaction (budget: ≤ `maxTxPerTick` per
+ *   tick), which returns the full outcome tree (`transaction_outcome` + `receipts_outcome`),
+ *   including the cross-contract callback receipts.
+ * - Global exponential backoff: any 429/5xx/network failure (either source) arms a backoff
+ *   (base = the poll interval, doubling per consecutive failure, cap 10 min) — ticks inside the
+ *   backoff window make NO API calls at all, so the other view endpoints keep their RPC budget.
+ * - Cursor: the newest ABSORBED tx's `(block_timestamp_ns, block_height)` + bounded dedupe sets
+ *   for txs and receipts; the cursor only advances AFTER the logs are absorbed (a crash
+ *   mid-tick re-discovers the queued txs — no silent loss, and `indexer_incomplete` says so).
+ * - Honest state: `indexer_incomplete` is `true` while the discovery source is failing, backing
+ *   off, or the backfill queue is not drained; the lag header = chain head − the newest
+ *   absorbed tx's block (documented meaning: with a quiet contract it grows because there is
+ *   genuinely no recent activity — the health signal is `indexer_incomplete`).
  */
 
-import { collectEventsFromChunk, absorbEvent, type EventStore } from "./events.js";
+import { absorbEvent, extractEventsFromLogs, type EventStore } from "./events.js";
 
 /** The slice of `NearRpcClient` the poller needs (injected as a stub in unit tests). */
 export interface PollerRpc {
   fetchJsonRpc<T>(method: string, params: unknown): Promise<T>;
 }
 
+/** Minimal fetch shape for the discovery source (injectable for tests). */
+export type DiscoveryFetch = (url: string) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+
 export interface PollerState {
-  /** Height of the last fully processed block; `null` until the first poll. */
+  /** `block_timestamp` (ns) of the newest ABSORBED tx; `null` until the first absorption. */
+  cursorTimestampNs: string | null;
+  /** Block height of the newest ABSORBED tx; `null` until the first absorption. */
   cursorHeight: number | null;
-  /** Last observed final-block head height. */
+  /** Last observed chain head (final). */
   headHeight: number | null;
+  /** head − the newest absorbed tx's block; `null` when nothing was absorbed yet. */
+  lagBlocks: number | null;
   /** Last poll error message; `null` when the last poll succeeded. */
   lastError: string | null;
-  /** True when the cursor has reached the observed head and the last poll succeeded. */
+  /** True when the last poll succeeded and no catch-up work remains. */
   caughtUp: boolean;
-  /** Distinct contract transactions processed (counter). */
+  /** Distinct contract txs whose outcome tree was fetched (counter). */
   processedTx: number;
-  /** Receipts already absorbed, as `${txHash}:${receiptId}` (bounded; pruned oldest-first). */
+  /** Ticks skipped because the global backoff was active. */
+  backedOffTicks: number;
+  /** Discovery/tx failures counted since start (429/5xx). */
+  rateLimitedErrors: number;
+  /** Absorb until this epoch-ms before polling again (global exponential backoff). */
+  backoffUntilMs: number;
+  /** Current backoff attempt counter (reset on success). */
+  backoffAttempts: number;
+  /** Pending txs discovered but not yet absorbed (oldest first; bounded). */
+  queue: Array<{ hash: string; receiver: string; timestampNs: string; height: number }>;
+  /** Tx hashes already discovered (bounded dedupe set). */
+  seenTx: Set<string>;
+  /** `${txHash}:${receiptId}` pairs already absorbed (bounded dedupe set). */
   seenReceipts: Set<string>;
-  /** Tx hashes queued for one re-query on the next tick (delayed callback receipts). */
-  recheck: string[];
 }
 
 export function newPollerState(): PollerState {
   return {
+    cursorTimestampNs: null,
     cursorHeight: null,
     headHeight: null,
+    lagBlocks: null,
     lastError: null,
     caughtUp: false,
     processedTx: 0,
+    backedOffTicks: 0,
+    rateLimitedErrors: 0,
+    backoffUntilMs: 0,
+    backoffAttempts: 0,
+    queue: [],
+    seenTx: new Set(),
     seenReceipts: new Set(),
-    recheck: [],
   };
 }
 
-/** Catch-up bound per tick: at most this many blocks are processed in one `pollOnce`. */
-export const MAX_BLOCKS_PER_TICK = 50;
+/** Discovery page size: the first (backfill) call fetches 50, later calls 25. */
+export const BACKFILL_LIMIT = 50;
+const DISCOVERY_LIMIT = 25;
+/** Bounded memory: at most this many tx hashes are remembered for dedupe. */
+const MAX_SEEN_TX = 2000;
 /** Bounded memory: at most this many receipt ids are remembered for dedupe. */
 const MAX_SEEN_RECEIPTS = 20000;
-/** At most this many txs get their one re-query pass per tick. */
-const MAX_RECHECK_PER_TICK = 25;
-/** At most this many new contract txs are fetched per tick (a burst guard). */
-const MAX_NEW_TX_PER_TICK = 50;
+/** Bounded queue: drop the oldest pending tx beyond this. */
+const MAX_QUEUE = 100;
+/** Backoff: base delay (ms) after the first failure, doubling per consecutive failure. */
+export const BACKOFF_BASE_MS = 15000;
+/** Backoff cap. */
+export const BACKOFF_MAX_MS = 600000;
 
-interface BlockResult {
-  header: { height: number };
-  /** The chunks included in this block (one per shard; NEAR names the hash `chunk_hash`). */
-  chunks: Array<{ chunk_hash?: string; chunk_id?: string }>;
+interface DiscoveryTx {
+  transaction_hash: string;
+  receiver_account_id: string;
+  signer_account_id: string;
+  block_timestamp: string; // nanoseconds as a string
+  block: { block_height: string };
 }
 
-interface ChunkResult {
-  /** Direct transactions in the chunk; the contract's events start from these. */
-  transactions?: Array<{ hash: string; receiver_id: string; signer_id: string }>;
-  receipts?: unknown[];
+interface DiscoveryResult {
+  data?: DiscoveryTx[] | null;
 }
 
 interface TxOutcomeResult {
   transaction_outcome?: { outcome?: { logs?: string[] } };
   receipts_outcome?: Array<{ receipt_id?: string; outcome?: { logs?: string[] } }>;
-  transaction?: { hash: string };
 }
 
-/** Lag in blocks between the observed chain head and the processed cursor. */
-export function indexerLagBlocks(state: PollerState): number | null {
-  if (state.headHeight === null) return null;
-  if (state.cursorHeight === null) return null;
-  return Math.max(0, state.headHeight - state.cursorHeight);
-}
-
-function rememberReceipt(state: PollerState, key: string): boolean {
-  if (state.seenReceipts.has(key)) return false;
-  state.seenReceipts.add(key);
-  while (state.seenReceipts.size > MAX_SEEN_RECEIPTS) {
-    const oldest = state.seenReceipts.values().next().value;
+function rememberSet(set: Set<string>, key: string, max: number): boolean {
+  if (set.has(key)) return false;
+  set.add(key);
+  while (set.size > max) {
+    const oldest = set.values().next().value;
     if (oldest === undefined) break;
-    state.seenReceipts.delete(oldest);
+    set.delete(oldest);
   }
   return true;
 }
@@ -115,15 +142,16 @@ export function absorbTxOutcome(
       receipt_id: `tx:${txHash}`,
       logs: result.transaction_outcome?.outcome?.logs ?? [],
     },
-    ...(result.receipts_outcome ?? []).map((r) => ({
-      receipt_id: r.receipt_id ?? `unknown:${absorbed}`,
+    ...(result.receipts_outcome ?? []).map((r, i) => ({
+      receipt_id: r.receipt_id ?? `unknown:${i}`,
       logs: r.outcome?.logs ?? [],
     })),
   ];
   for (const receipt of receipts) {
     const key = `${txHash}:${receipt.receipt_id}`;
-    if (!rememberReceipt(state, key)) continue;
-    for (const ev of collectEventsFromChunk({ receipts: [{ receipt_id: receipt.receipt_id, outcome: { logs: receipt.logs } }] })) {
+    if (!rememberSet(state.seenReceipts, key, MAX_SEEN_RECEIPTS)) continue;
+    for (const ev of extractEventsFromLogs(receipt.logs)) {
+      ev.receipt_id = receipt.receipt_id;
       ev.block_height = blockHeight;
       absorbEvent(store, ev);
       absorbed++;
@@ -132,72 +160,125 @@ export function absorbTxOutcome(
   return absorbed;
 }
 
-async function fetchTxOutcome(rpc: PollerRpc, txHash: string, receiverId: string): Promise<TxOutcomeResult> {
-  // The `tx` RPC takes positional [tx_hash, account_id] params.
-  return rpc.fetchJsonRpc<TxOutcomeResult>("tx", [txHash, receiverId]);
+function refreshLag(state: PollerState): void {
+  state.lagBlocks =
+    state.headHeight === null || state.cursorHeight === null
+      ? null
+      : Math.max(0, state.headHeight - state.cursorHeight);
 }
 
 /**
- * Poll once: discover + fetch the contract's transactions in the unprocessed blocks (bounded),
- * absorb their NEP-297 events, run one bounded recheck pass for delayed callback receipts,
- * and advance the cursor. Throws on RPC failure after built-in retries;
- * `state.lastError` is set before rethrowing so the caller can log it.
+ * Poll once with a small RPC budget:
+ * 1. discovery (1 NearBlocks call) → new contract txs newest-first;
+ * 2. the chain head (1 `block` call) → lag;
+ * 3. absorb up to `maxTxPerTick` queued txs (1 `tx` call each).
+ * When either source 429s/fails, a global exponential backoff is armed and the state is
+ * marked incomplete (honest). Transport failures are recorded in `state.lastError`; this
+ * function does not throw for them.
  */
 export async function pollOnce(
   rpc: PollerRpc,
+  discoveryFetch: DiscoveryFetch,
   contractId: string,
   store: EventStore,
   state: PollerState,
+  nowMs: number = Date.now(),
+  maxTxPerTick = 5,
 ): Promise<PollerState> {
-  try {
-    const head = await rpc.fetchJsonRpc<BlockResult>("block", { finality: "final" });
-    if (typeof head?.header?.height !== "number" || !Array.isArray(head.chunks)) {
-      throw new Error("malformed block result");
-    }
-    state.headHeight = head.header.height;
-
-    // 1) One recheck pass: txs from the previous tick may have executed their callback receipts by now.
-    const recheckNow = state.recheck.splice(0, MAX_RECHECK_PER_TICK);
-    for (const txHash of recheckNow) {
-      const result = await fetchTxOutcome(rpc, txHash, contractId);
-      absorbTxOutcome(store, state, txHash, result, state.cursorHeight ?? head.header.height);
-    }
-
-    // 2) Discover contract txs in the unprocessed blocks and fetch their outcome trees.
-    // First poll: start at the head (no unbounded backfill). Later polls: catch up.
-    const start = state.cursorHeight === null ? head.header.height : state.cursorHeight + 1;
-    const end = Math.min(head.header.height, start + MAX_BLOCKS_PER_TICK - 1);
-
-    for (let height = start; height <= end; height++) {
-      const block = await rpc.fetchJsonRpc<BlockResult>("block", { block_id: height });
-      if (typeof block?.header?.height !== "number" || !Array.isArray(block.chunks)) {
-        throw new Error(`malformed block result at height ${height}`);
-      }
-      const chunkIds = block.chunks
-        .map((c) => c.chunk_hash ?? c.chunk_id)
-        .filter((id): id is string => typeof id === "string");
-      for (const chunkId of chunkIds) {
-        const chunk = await rpc.fetchJsonRpc<ChunkResult>("chunk", { chunk_id: chunkId });
-        const txs = (chunk.transactions ?? []).filter((t) => t.receiver_id === contractId);
-        for (const tx of txs) {
-          const result = await fetchTxOutcome(rpc, tx.hash, contractId);
-          absorbTxOutcome(store, state, tx.hash, result, height);
-          state.processedTx += 1;
-          state.recheck.push(tx.hash); // one re-query next tick for delayed callbacks
-          while (state.recheck.length > MAX_RECHECK_PER_TICK * 2) state.recheck.shift();
-        }
-      }
-      state.cursorHeight = height;
-    }
-
-    state.caughtUp = state.cursorHeight !== null && state.cursorHeight >= head.header.height;
-    state.lastError = null;
-    store.indexerComplete = state.caughtUp;
-  } catch (err) {
-    state.lastError = String(err instanceof Error ? err.message : err);
+  // Global backoff: skip this tick entirely (no API calls) while armed.
+  if (nowMs < state.backoffUntilMs) {
+    state.backedOffTicks += 1;
     state.caughtUp = false;
     store.indexerComplete = false;
-    throw err;
+    return state;
   }
+
+  const fail = (msg: string, isRateLimit: boolean): void => {
+    state.lastError = msg;
+    state.caughtUp = false;
+    if (isRateLimit) state.rateLimitedErrors += 1;
+    state.backoffAttempts += 1;
+    state.backoffUntilMs =
+      nowMs + Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(state.backoffAttempts, 10));
+    store.indexerComplete = false; // honest: the indexer is behind/failing
+  };
+
+  // 1) Discovery: new contract txs, newest first.
+  let discovered: DiscoveryTx[];
+  try {
+    const limit = state.cursorTimestampNs === null ? BACKFILL_LIMIT : DISCOVERY_LIMIT;
+    const res = await discoveryFetch(`${pollerDiscoveryUrl(contractId)}?limit=${limit}`);
+    if (!res.ok) {
+      fail(`discovery HTTP ${res.status}`, res.status === 429);
+      return state;
+    }
+    const body = (await res.json()) as DiscoveryResult;
+    discovered = Array.isArray(body.data) ? body.data : [];
+  } catch (err) {
+    fail(`discovery failed: ${String(err instanceof Error ? err.message : err)}`, false);
+    return state;
+  }
+
+  // 2) Queue the not-yet-seen txs OLDEST FIRST (the feed is newest-first, so iterate backwards);
+  // the cursor advances only after absorption.
+  for (const tx of [...discovered].reverse()) {
+    if (!tx.transaction_hash || !tx.block?.block_height) continue;
+    if (tx.receiver_account_id !== contractId && tx.signer_account_id !== contractId) continue;
+    if (!rememberSet(state.seenTx, tx.transaction_hash, MAX_SEEN_TX)) continue;
+    state.queue.push({
+      hash: tx.transaction_hash,
+      receiver: tx.receiver_account_id === contractId ? tx.receiver_account_id : tx.signer_account_id,
+      timestampNs: String(tx.block_timestamp),
+      height: Number(tx.block.block_height),
+    });
+    while (state.queue.length > MAX_QUEUE) state.queue.shift(); // drop the oldest pending
+  }
+
+  // 3) The chain head (1 `block` call) → lag.
+  try {
+    const head = await rpc.fetchJsonRpc<{ header?: { height?: number } }>("block", { finality: "final" });
+    const h = head?.header?.height;
+    if (typeof h !== "number") throw new Error("malformed block result");
+    state.headHeight = h;
+  } catch (err) {
+    const msg = String(err instanceof Error ? err.message : err);
+    fail(`head failed: ${msg}`, /429/.test(msg));
+    return state;
+  }
+
+  // 4) Absorb the queued txs oldest-first, within the per-tick budget (1 `tx` call each).
+  while (state.queue.length > 0 && maxTxPerTick > 0) {
+    const item = state.queue.shift()!;
+    maxTxPerTick -= 1;
+    try {
+      // The `tx` RPC takes positional [tx_hash, account_id] params.
+      const result = await rpc.fetchJsonRpc<TxOutcomeResult>("tx", [item.hash, item.receiver]);
+      absorbTxOutcome(store, state, item.hash, result, item.height);
+      state.processedTx += 1;
+      // The cursor advances only after absorption (a crash before this re-discovers the tx).
+      if (state.cursorTimestampNs === null || BigInt(item.timestampNs) > BigInt(state.cursorTimestampNs)) {
+        state.cursorTimestampNs = item.timestampNs;
+        state.cursorHeight = item.height;
+      }
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err);
+      fail(`tx ${item.hash.slice(0, 10)}… failed: ${msg}`, /429/.test(msg));
+      // Put the tx back at the front of the queue (it stays pending, no silent loss).
+      state.queue.unshift(item);
+      refreshLag(state);
+      return state;
+    }
+  }
+
+  state.caughtUp = state.queue.length === 0;
+  state.lastError = null;
+  state.backoffAttempts = 0;
+  store.indexerComplete = state.caughtUp;
+  refreshLag(state); // stays fresh even when the contract is quiet
   return state;
+}
+
+/** The NearBlocks v3 discovery URL for one account (no API key required). */
+export function pollerDiscoveryUrl(contractId: string): string {
+  return `https://api-testnet.nearblocks.io/v3/accounts/${contractId}/txns`;
 }
