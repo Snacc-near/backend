@@ -110,8 +110,15 @@ interface DiscoveryResult {
 }
 
 interface TxOutcomeResult {
-  transaction_outcome?: { outcome?: { logs?: string[] } };
-  receipts_outcome?: Array<{ receipt_id?: string; outcome?: { logs?: string[] } }>;
+  // The `tx` RPC (`EXPERIMENTAL_tx_status`) names the receipt identifier `id`
+  // (verified live against testnet: receipts_outcome[].id + transaction_outcome.id);
+  // `receipt_id` is kept only as a legacy fallback for older/other fixtures.
+  transaction_outcome?: { id?: string; outcome?: { logs?: string[] } };
+  receipts_outcome?: Array<{
+    id?: string;
+    receipt_id?: string;
+    outcome?: { logs?: string[] };
+  }>;
 }
 
 function rememberSet(set: Set<string>, key: string, max: number): boolean {
@@ -139,11 +146,16 @@ export function absorbTxOutcome(
   let absorbed = 0;
   const receipts = [
     {
-      receipt_id: `tx:${txHash}`,
+      // Real id from the RPC (`transaction_outcome.id`, equal to the tx hash);
+      // `tx:<hash>` stays as the safe fallback when the field is absent.
+      receipt_id: result.transaction_outcome?.id ?? `tx:${txHash}`,
       logs: result.transaction_outcome?.outcome?.logs ?? [],
     },
     ...(result.receipts_outcome ?? []).map((r, i) => ({
-      receipt_id: r.receipt_id ?? `unknown:${i}`,
+      // Real id first (`id`, verified against the live `tx` RPC shape), then the
+      // legacy `receipt_id`, then a stable last resort. The dedupe key below
+      // always carries the tx hash, so `unknown:${i}` can never collide across txs.
+      receipt_id: r.id ?? r.receipt_id ?? `unknown:${i}`,
       logs: r.outcome?.logs ?? [],
     })),
   ];
