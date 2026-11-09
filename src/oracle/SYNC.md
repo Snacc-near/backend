@@ -1,13 +1,13 @@
-# src/oracle — salinan terversi dari `oracle-tee`
+# src/oracle — versioned copy from `oracle-tee`
 
-Sumber: repo `oracle-tee` commit `21ddaeb` (`src/redact.ts`, `src/pipeline.ts`, `src/enclave-client.ts`).
-Backend dideploy dari clone repo ini saja (0 dependency runtime), jadi `oracle-tee` tidak bisa diimpor
-sebagai paket; berkas disalin **tanpa perubahan** kecuali:
+Source: `oracle-tee` repo commit `21ddaeb` (`src/redact.ts`, `src/pipeline.ts`, `src/enclave-client.ts`).
+The backend is deployed from a standalone clone of this repo (0 runtime dependencies), so `oracle-tee` cannot be imported
+as an external package; files are copied **verbatim** except:
 
-- `enclave-client.ts`: bagian `RES-101` (jalur `@nearai/inference-sdk`) dibuang — butuh dependency
-  runtime yang backend sengaja tidak punya. Jalur HTTP langsung (`runGenomeExperiment`) tetap
-  memverifikasi `signed_text` + ed25519 secara lokal.
+- `enclave-client.ts`: the `RES-101` section (`@nearai/inference-sdk` path) is omitted — it requires a
+  runtime dependency that the backend intentionally omits. The direct HTTP path (`runGenomeExperiment`) still
+  verifies `signed_text` + ed25519 locally.
 
-`test/oracle-sync.test.ts` membandingkan salinan ini dengan `../oracle-tee/src` bila repo itu ada di
-sebelah (otomatis dilewati di clone tunggal) agar drift ketahuan. Jangan edit berkas di sini; ubah di
-`oracle-tee` lalu salin ulang dan perbarui hash di atas.
+`test/oracle-sync.test.ts` compares this copy against `../oracle-tee/src` whenever the sibling repo is present
+(automatically skipped in a standalone clone) to catch drift. Do not edit files here independently; update
+`oracle-tee` first, then re-copy and update the commit hash above.

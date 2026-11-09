@@ -47,24 +47,24 @@ function clientWithRpcError(data: string): NearRpcClient {
   return new NearRpcClient("http://rpc.test", fetchFn);
 }
 
-test("zoneOf: batas 600/610 (ECON-111 supersede 1400)", () => {
+test("zoneOf: 600/610 boundaries (ECON-111 supersedes 1400)", () => {
   assert.equal(zoneOf(599), "Hypothermia");
   assert.equal(zoneOf(600), "Goldilocks");
   assert.equal(zoneOf(610), "Goldilocks");
   assert.equal(zoneOf(611), "Fever");
 });
 
-test("fetchMacroState memetakan field sesuai spec", async () => {
+test("fetchMacroState maps fields per spec", async () => {
   const m = await fetchMacroState(clientWithResult(MACRO_STATE), "snacc-v001.testnet");
   assert.ok(!("error" in m));
-  assert.equal(m.zone, "Fever"); // 1120 mK > 610 (threshold ECON-111) = Fever
+  assert.equal(m.zone, "Fever"); // 1120 mK > 610 (ECON-111 threshold) = Fever
   assert.equal(m.crucibleTemp, 1120);
   assert.equal(m.totalSnaccSupply, "1000000");
   assert.equal(m.ruleBoundTreasury, "200000");
   assert.equal(m.blockHeight, 777);
 });
 
-test("fetchMacroState -> contract_not_deployed saat akun tidak ada", async () => {
+test("fetchMacroState -> contract_not_deployed when account does not exist", async () => {
   const m = await fetchMacroState(
     clientWithRpcError("account snacc-v001.testnet does not exist while viewing"),
     "snacc-v001.testnet",
@@ -72,7 +72,7 @@ test("fetchMacroState -> contract_not_deployed saat akun tidak ada", async () =>
   assert.deepEqual(m, { error: "contract_not_deployed" });
 });
 
-test("fetchStrain mengembalikan view utuh", async () => {
+test("fetchStrain returns full view", async () => {
   const strain = { strain_id: 1, owner_id: "a.testnet", effective_vitality: 8500 };
   const s = await fetchStrain(clientWithResult(strain), "snacc-v001.testnet", 1);
   assert.ok(!("error" in s));
@@ -80,7 +80,7 @@ test("fetchStrain mengembalikan view utuh", async () => {
   assert.equal(s.effective_vitality, 8500);
 });
 
-test("fetchStrain -> strain_not_found untuk null", async () => {
+test("fetchStrain -> strain_not_found for null", async () => {
   const s = await fetchStrain(clientWithResult(null), "snacc-v001.testnet", 99);
   assert.deepEqual(s, { error: "strain_not_found" });
 });
@@ -94,7 +94,7 @@ test("fetchStrain -> contract_not_deployed", async () => {
   assert.deepEqual(s, { error: "contract_not_deployed" });
 });
 
-test("error RPC lain tetap dilempar (bukan ditelan)", async () => {
+test("other RPC errors are rethrown (not swallowed)", async () => {
   await assert.rejects(
     () => fetchMacroState(clientWithRpcError("gas limit exceeded"), "c.near"),
     RpcError,

@@ -12,12 +12,12 @@ function fakeReq(path: string): IncomingMessage {
 
 type Handler = (args: Record<string, unknown>) => string | { panic: string };
 
-/** RPC palsu per method kontrak. `string` = teks JSON mentah (boleh u128 tanpa kutip). */
+/** Fake RPC per contract method. `string` = raw JSON text (may contain unquoted u128). */
 function rpcByMethod(handlers: Record<string, Handler>): NearRpcClient {
   const fetchFn = (async (_url: string, init: RequestInit) => {
     const req = JSON.parse(String(init.body)) as { params: { method_name: string; args_base64: string } };
     const h = handlers[req.params.method_name];
-    if (!h) throw new Error(`method tak di-stub: ${req.params.method_name}`);
+    if (!h) throw new Error(`unstubbed method: ${req.params.method_name}`);
     const args = JSON.parse(Buffer.from(req.params.args_base64, "base64").toString("utf8")) as Record<string, unknown>;
     const out = h(args);
     const result =
@@ -36,16 +36,16 @@ function deps(rpc: NearRpcClient, extra: Record<string, unknown> = {}) {
 const strainJson = (id: number, status = "Active") =>
   `{"strain_id":${id},"owner_id":"a.testnet","vault_subaccount":"s-${id}.snacc-v001.testnet","vitality":8500,"atp_balance":575782630123456789012345,"status":"${status}","effective_vitality":8400}`;
 
-test("quoteU128Fields: u128 tanpa kutip jadi string presisi, bukan float", () => {
+test("quoteU128Fields: unquoted u128 becomes exact string, not float", () => {
   const raw = '{"atp_balance":575782630123456789012345,"other":12}';
   const parsed = JSON.parse(quoteU128Fields(raw, ["atp_balance"])) as { atp_balance: string; other: number };
   assert.equal(parsed.atp_balance, "575782630123456789012345");
   assert.equal(parsed.other, 12);
-  // sudah ber-kutip -> tidak dobel
+  // already quoted -> not double-quoted
   assert.equal(quoteU128Fields('{"atp_balance":"5"}', ["atp_balance"]), '{"atp_balance":"5"}');
 });
 
-test("/api/strains: enumerasi nft_total_supply + get_strain, hitung status", async () => {
+test("/api/strains: enumerate nft_total_supply + get_strain, count statuses", async () => {
   const rpc = rpcByMethod({
     nft_total_supply: () => '"3"',
     get_strain: (a) => strainJson(a["strain_id"] as number, a["strain_id"] === 2 ? "Distressed" : a["strain_id"] === 3 ? "SplicedBurned" : "Active"),
@@ -60,26 +60,26 @@ test("/api/strains: enumerasi nft_total_supply + get_strain, hitung status", asy
   assert.equal(b.totalMinted, 3);
   assert.equal(b.truncated, false);
   assert.equal(b.indexer_incomplete, false);
-  // alias spec
+  // spec alias
   const alias = await route(fakeReq("/api/crucible/strains"), deps(rpc));
   assert.equal(alias.status, 200);
 });
 
-test("/api/strains: 0 strain -> daftar kosong jujur", async () => {
+test("/api/strains: 0 strains -> honest empty list", async () => {
   const rpc = rpcByMethod({ nft_total_supply: () => '"0"' });
   const res = await route(fakeReq("/api/strains"), deps(rpc));
   assert.equal(res.status, 200);
   assert.deepEqual((res.body as { strains: unknown[] }).strains, []);
 });
 
-test("/api/strains/:id: view panic -> 404 strain_not_found (bukan 500)", async () => {
+test("/api/strains/:id: view panic -> 404 strain_not_found (not 500)", async () => {
   const rpc = rpcByMethod({ get_strain: () => ({ panic: "wasm execution failed with error: WasmTrap(Unreachable)" }) });
   const res = await route(fakeReq("/api/strains/99"), deps(rpc));
   assert.equal(res.status, 404);
   assert.deepEqual(res.body, { error: "strain_not_found" });
 });
 
-test("/api/strains/:id/svg: decode data URI nft_token -> image/svg+xml", async () => {
+test("/api/strains/:id/svg: decode nft_token data URI -> image/svg+xml", async () => {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"></svg>';
   const rpc = rpcByMethod({
     nft_token: (a) => {
@@ -100,7 +100,7 @@ test("/api/strains/:id/svg: decode data URI nft_token -> image/svg+xml", async (
   assert.equal(alias.status, 200);
 });
 
-test("/api/strains/:id/svg: token tak ada -> 404; media bukan SVG -> 502", async () => {
+test("/api/strains/:id/svg: missing token -> 404; non-SVG media -> 502", async () => {
   const missing = await route(
     fakeReq("/api/strains/9/svg"),
     deps(rpcByMethod({ nft_token: () => ({ panic: "ERR_STRAIN_NOT_FOUND" }) })),
@@ -114,7 +114,7 @@ test("/api/strains/:id/svg: token tak ada -> 404; media bukan SVG -> 502", async
   assert.deepEqual(odd.body, { error: "svg_media_unavailable" });
 });
 
-test("/api/colony/:owner: get_colony + get_colony_atp; account id invalid -> 400", async () => {
+test("/api/colony/:owner: get_colony + get_colony_atp; invalid account id -> 400", async () => {
   const rpc = rpcByMethod({
     get_colony: (a) => {
       assert.equal(a["owner_id"], "alkemis.testnet");
@@ -135,7 +135,7 @@ test("/api/colony/:owner: get_colony + get_colony_atp; account id invalid -> 400
   }
 });
 
-test("/api/dividends: pool + rate epoch + kontribusi opsional", async () => {
+test("/api/dividends: pool + epoch rates + optional contribution", async () => {
   const asked: number[] = [];
   const rpc = rpcByMethod({
     get_dividend_pool: () => '["64000000000000","353714000000000000000000",2]',
@@ -170,7 +170,7 @@ test("/api/dividends: pool + rate epoch + kontribusi opsional", async () => {
   assert.equal(half.status, 400);
 });
 
-test("/api/appetite: get_appetite_meter + top feeder, u128 presisi", async () => {
+test("/api/appetite: get_appetite_meter + top feeder, exact u128 strings", async () => {
   const rpc = rpcByMethod({
     get_appetite_meter: () =>
       '{"zone":"FEVER","crucible_temp":673,"current_epoch":2,"burst_bps":0,"burst_until":0,"burst_epochs_left":0,"dormant":false,"feast_volume":422128000000000000000000,"feast_target":79264999950000000000000,"risk_heat":10000}',
@@ -189,7 +189,7 @@ test("/api/appetite: get_appetite_meter + top feeder, u128 presisi", async () =>
   assert.equal(b.top_feeders[0]?.amount, "422128000000000000000000");
 });
 
-test("/api/zones: zona sekarang dari view + riwayat dari event store (tandai tidak lengkap)", async () => {
+test("/api/zones: current zone from view + history from event store (marked incomplete)", async () => {
   const rpc = rpcByMethod({
     get_appetite_meter: () => '{"zone":"FEVER","crucible_temp":673,"current_epoch":2,"feast_volume":1,"feast_target":2}',
     get_macro_state: () =>
@@ -209,7 +209,7 @@ test("/api/zones: zona sekarang dari view + riwayat dari event store (tandai tid
   assert.equal(b.history_complete, false);
 });
 
-test("view route -> 503 contract_not_deployed bila akun kontrak tak ada", async () => {
+test("view routes -> 503 contract_not_deployed when contract account is missing", async () => {
   const fetchFn = (async () =>
     new Response(
       JSON.stringify({ jsonrpc: "2.0", id: "x", error: { code: -32000, message: "Server error", data: "account c.testnet does not exist while viewing" } }),
@@ -223,7 +223,7 @@ test("view route -> 503 contract_not_deployed bila akun kontrak tak ada", async 
   }
 });
 
-test("RPC 429 di-retry lalu berhasil; 429 terus-menerus -> 503 rpc_unavailable (bukan 500)", async () => {
+test("RPC 429 is retried then succeeds; persistent 429 -> 503 rpc_unavailable (not 500)", async () => {
   let n = 0;
   const flaky = (async () => {
     n++;
@@ -235,7 +235,7 @@ test("RPC 429 di-retry lalu berhasil; 429 terus-menerus -> 503 rpc_unavailable (
   }) as unknown as typeof fetch;
   const r = await new NearRpcClient("http://rpc.test", flaky, 0).viewFunction("c.near", "nft_total_supply", "e30=");
   assert.equal(r.text, '"7"');
-  assert.equal(n, 3, "2x 429 lalu sukses");
+  assert.equal(n, 3, "2x 429 then success");
 
   const always429 = (async () => new Response("x", { status: 429 })) as unknown as typeof fetch;
   const res = await route(fakeReq("/api/zones"), deps(new NearRpcClient("http://rpc.test", always429, 0)));
@@ -243,7 +243,7 @@ test("RPC 429 di-retry lalu berhasil; 429 terus-menerus -> 503 rpc_unavailable (
   assert.equal((res.body as { error: string }).error, "rpc_unavailable");
 });
 
-test("/api/tee/attestation-report: petakan ke bentuk spec + cache + error hulu", async () => {
+test("/api/tee/attestation-report: maps to spec shape + caches + handles upstream errors", async () => {
   clearAttestationCache();
   let calls = 0;
   const upstream = {
@@ -264,7 +264,7 @@ test("/api/tee/attestation-report: petakan ke bentuk spec + cache + error hulu",
   assert.deepEqual(b.gatewayAttestation, upstream.gateway_attestation);
   assert.deepEqual(b.modelAttestations, upstream.model_attestations);
   await route(fakeReq("/api/tee/attestation-report"), d);
-  assert.equal(calls, 1, "panggilan kedua dilayani dari cache");
+  assert.equal(calls, 1, "second call served from cache");
 
   clearAttestationCache();
   const down = await route(fakeReq("/api/tee/attestation-report"), deps(rpcByMethod({}), {

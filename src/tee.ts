@@ -1,6 +1,6 @@
 /**
- * Proxy laporan attestation hardware enclave NEAR AI Cloud (`GET /v1/attestation/report`, VC-015).
- * Publik (tanpa API key). Respons diteruskan apa adanya ke bentuk spec:
+ * Proxy for the NEAR AI Cloud enclave hardware attestation report (`GET /v1/attestation/report`, VC-015).
+ * Public (no API key required). Response is mapped directly to the spec shape:
  * `{ model, signingAddress, gatewayAttestation, modelAttestations }`.
  */
 
@@ -8,7 +8,7 @@ export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 export const TEE_MODEL = "z-ai/glm-5.3-flash";
 export const ATTESTATION_URL = `https://cloud-api.near.ai/v1/attestation/report?model=${encodeURIComponent(TEE_MODEL)}&signing_algo=ed25519`;
-/** Laporan ±300 KB dan jarang berubah: cache singkat agar endpoint publik tak membebani hulu. */
+/** Report is ±300 KB and changes infrequently: cache briefly so public endpoint calls do not hammer upstream. */
 export const ATTESTATION_TTL_MS = 60_000;
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
@@ -52,7 +52,7 @@ export async function fetchAttestation(
   const gw = raw["gateway_attestation"] as Record<string, unknown> | undefined;
   const models = raw["model_attestations"];
   if (!gw || typeof gw["signing_address"] !== "string" || !Array.isArray(models)) {
-    return { error: "tee_upstream_malformed", detail: "gateway_attestation/model_attestations hilang" };
+    return { error: "tee_upstream_malformed", detail: "missing gateway_attestation/model_attestations" };
   }
   const value: AttestationResponse = {
     model: TEE_MODEL,

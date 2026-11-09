@@ -1,18 +1,18 @@
 /**
- * Verifikasi pesan bertanda tangan NEP-413 (VC-015), Node murni.
- * Payload yang ditandatangani = sha256( u32le(2^31 + 413) ‖ borsh(Payload) ), Payload =
+ * NEP-413 signed message verification (VC-015), pure Node.
+ * Signed payload = sha256( u32le(2^31 + 413) ‖ borsh(Payload) ), where Payload =
  * { message: String, nonce: [u8;32], recipient: String, callback_url: Option<String> }.
- * Tanda tangan ed25519 atas hash tersebut.
+ * ed25519 signature over that hash.
  */
 
 import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
 
-/** Tag NEP-413 (2^31 + 413), prefix domain agar tanda tangan tak bisa dipakai sebagai tx. */
+/** NEP-413 tag (2^31 + 413), domain prefix ensuring a signed message cannot be replayed as a transaction. */
 export const NEP413_TAG = 2147484061;
 
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-/** Base58 (alfabet Bitcoin) -> bytes; `null` bila ada karakter tak valid. */
+/** Base58 (Bitcoin alphabet) -> bytes; returns `null` if any invalid character is present. */
 export function base58Decode(s: string): Buffer | null {
   if (s.length === 0) return Buffer.alloc(0);
   let n = 0n;
@@ -28,7 +28,7 @@ export function base58Decode(s: string): Buffer | null {
   return Buffer.concat([Buffer.alloc(zeros), body]);
 }
 
-/** `ed25519:<base58>` -> 32 byte kunci publik; `null` bila format/panjang salah. */
+/** `ed25519:<base58>` -> 32-byte raw public key; returns `null` if format/length is invalid. */
 export function parseEd25519PublicKey(pk: string): Buffer | null {
   if (!pk.startsWith("ed25519:")) return null;
   const raw = base58Decode(pk.slice("ed25519:".length));
@@ -44,12 +44,12 @@ function borshString(s: string): Buffer {
 
 export interface Nep413Payload {
   message: string;
-  nonce: Buffer; // 32 byte
+  nonce: Buffer; // 32 bytes
   recipient: string;
   callbackUrl?: string | null;
 }
 
-/** sha256 atas serialisasi borsh NEP-413 — byte yang benar-benar ditandatangani dompet. */
+/** sha256 over the NEP-413 Borsh serialization — the exact bytes signed by the wallet. */
 export function nep413Hash(p: Nep413Payload): Buffer {
   const tag = Buffer.alloc(4);
   tag.writeUInt32LE(NEP413_TAG);
@@ -58,7 +58,7 @@ export function nep413Hash(p: Nep413Payload): Buffer {
   return createHash("sha256").update(ser).digest();
 }
 
-/** SPKI DER prefix untuk kunci publik ed25519 mentah 32 byte. */
+/** SPKI DER prefix for a raw 32-byte ed25519 public key. */
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 export function verifyNep413(publicKey: string, payload: Nep413Payload, signature: Buffer): boolean {
@@ -72,7 +72,7 @@ export function verifyNep413(publicKey: string, payload: Nep413Payload, signatur
   }
 }
 
-/** Base64 standar atau base64url -> bytes (dompet berbeda memakai varian berbeda). */
+/** Standard base64 or base64url -> bytes (different wallets emit different variants). */
 export function decodeB64(s: string): Buffer | null {
   if (typeof s !== "string" || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(s)) return null;
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");

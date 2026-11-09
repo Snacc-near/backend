@@ -1,7 +1,7 @@
 /**
- * Pemetaan view kontrak -> skema /api/crucible/* (DOC-113, Spec API Backend).
- * Semua nama field disalin persis dari `contracts/snacc/src/state.rs` dan spec.
- * Tidak ada nilai default yang dikarang: field RPC diteruskan apa adanya.
+ * Contract view -> /api/crucible/* schema mapping (DOC-113, Backend API Spec).
+ * All field names are copied verbatim from `contracts/snacc/src/state.rs` and the spec.
+ * No fabricated default values: RPC fields are forwarded as-is.
  */
 
 import { NearRpcClient, ViewPanicError, isContractNotDeployed, quoteU128Fields } from "./near.js";
@@ -37,19 +37,19 @@ export interface StrainVesselView {
 }
 
 /**
- * Field u128/u64 besar di `StrainVesselView` (literal angka di RPC -> string presisi).
- * `last_allocate_epoch` memakai sentinel u64::MAX (18446744073709551615) yang tak muat float64.
+ * Large u128/u64 fields in `StrainVesselView` (numeric literals in RPC -> exact strings).
+ * `last_allocate_epoch` uses the u64::MAX sentinel (18446744073709551615) which exceeds float64 precision.
  */
 export const STRAIN_U128_FIELDS = ["atp_balance", "last_allocate_epoch"] as const;
 
 export function zoneOf(crucibleTemp: number): "Fever" | "Goldilocks" | "Hypothermia" {
-  // `ECON-111` (2026-11-08): FEVER 1400 -> 610 mK (supersede; 1400 tak terjangkau -> burn mati).
+  // `ECON-111` (2026-11-08): FEVER 1400 -> 610 mK (supersedes 1400; 1400 was unreachable -> burn inactive).
   if (crucibleTemp > 610) return "Fever";
   if (crucibleTemp < 600) return "Hypothermia";
   return "Goldilocks";
 }
 
-/** u128 dari teks JSON mentah — JANGAN lewat `JSON.parse` (float64 -> notasi e, presisi hilang). */
+/** Extract u128 from raw JSON text — DO NOT pass through `JSON.parse` (float64 -> scientific notation, loses precision). */
 function u128From(text: string, key: string): string {
   const m = text.match(new RegExp(`"${key}":\\s*"?(\\d+)`));
   return m?.[1] ?? "0";
@@ -97,7 +97,7 @@ export async function fetchStrain(
     text = r.text;
   } catch (err) {
     if (isContractNotDeployed(err)) return { error: "contract_not_deployed" };
-    // `get_strain` hanya panik lewat ERR_STRAIN_NOT_FOUND (RPC melapor WasmTrap tanpa pesan).
+    // `get_strain` panics only via ERR_STRAIN_NOT_FOUND (RPC reports WasmTrap without a custom message).
     if (err instanceof ViewPanicError) return { error: "strain_not_found" };
     throw err;
   }

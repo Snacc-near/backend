@@ -1,6 +1,6 @@
 /**
- * Klien JSON-RPC NEAR minimal (runtime 0-dependency).
- * `fetchFn` dapat diinjeksi untuk unit test (INT-108).
+ * Minimal NEAR JSON-RPC client (0 runtime dependencies).
+ * `fetchFn` can be injected for unit tests (INT-108).
  */
 
 export interface JsonRpcResponse<T> {
@@ -44,21 +44,21 @@ export class RpcError extends Error {
 const RETRY_ATTEMPTS = 3;
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
-/** View method panik di kontrak: RPC membalas `result.error` (bukan `error`) tanpa `result.result`. */
+/** Contract view method panicked: RPC returns `result.error` (not top-level `error`) without `result.result`. */
 export class ViewPanicError extends Error {
   constructor(
     public readonly method: string,
     public readonly detail: string,
   ) {
-    super(`view ${method} panik: ${detail}`);
+    super(`view ${method} panicked: ${detail}`);
     this.name = "ViewPanicError";
   }
 }
 
 /**
- * u128 di view kontrak keluar sebagai literal angka tanpa tanda kutip (mis. `"atp_balance":575782630`);
- * `JSON.parse` memotongnya ke float64. Bungkus field u128 bernama dengan tanda kutip SEBELUM parse
- * supaya presisi utuh (prinsip "u128 = string presisi"). Hanya mengubah `"key": <digit>`.
+ * u128 values in contract views are emitted as unquoted numeric literals (e.g. `"atp_balance":575782630`);
+ * `JSON.parse` truncates them to float64. Wrap named u128 fields in quotes BEFORE parsing
+ * so full precision is preserved ("u128 = exact string" principle). Only transforms `"key": <digits>`.
  */
 export function quoteU128Fields(text: string, keys: readonly string[]): string {
   let out = text;
@@ -72,7 +72,7 @@ export class NearRpcClient {
   constructor(
     private readonly rpcUrl: string,
     private readonly fetchFn: typeof fetch = fetch,
-    /** Jeda dasar retry (ms) untuk HTTP 429/502/503/504 dari RPC publik; 0 = tanpa jeda (test). */
+    /** Base retry delay (ms) for HTTP 429/502/503/504 from public RPC; 0 = no delay (tests). */
     private readonly retryDelayMs: number = 400,
   ) {}
 
@@ -91,13 +91,13 @@ export class NearRpcClient {
     if (!res.ok) {
       throw new RpcError({
         code: -32000,
-        message: `HTTP ${res.status} dari RPC`,
+        message: `HTTP ${res.status} from RPC`,
       });
     }
     const body = (await res.json()) as JsonRpcResponse<T>;
     if (body.error) throw new RpcError(body.error);
     if (body.result === undefined) {
-      throw new RpcError({ code: -32603, message: "respons tanpa result" });
+      throw new RpcError({ code: -32603, message: "response missing result" });
     }
     return body.result;
   }
@@ -110,7 +110,7 @@ export class NearRpcClient {
     });
   }
 
-  /** Panggil view method kontrak; return value NEAR-serialized di-decode ke teks. */
+  /** Call a contract view method; NEAR-serialized return value is decoded to UTF-8 text. */
   async viewFunction(
     contractId: string,
     methodName: string,
@@ -124,15 +124,15 @@ export class NearRpcClient {
       args_base64: argsBase64,
     });
     if (!Array.isArray(r.result)) {
-      throw new ViewPanicError(methodName, String(r.error ?? "respons view tanpa result"));
+      throw new ViewPanicError(methodName, String(r.error ?? "view response missing result"));
     }
     const text = Buffer.from(r.result).toString("utf8");
     return { text, logs: r.logs, block_height: r.block_height };
   }
 
   /**
-   * `view_access_key`: izin kunci pada akun, atau `null` bila kunci/akun tidak ada.
-   * Node melaporkan "tidak ada" sebagai error JSON-RPC atau sebagai `result.error` tanpa `permission`.
+   * `view_access_key`: key permission on the account, or `null` if the key/account does not exist.
+   * NEAR nodes report "not found" either as a JSON-RPC error or as `result.error` without `permission`.
    */
   async viewAccessKey(accountId: string, publicKey: string): Promise<{ permission: unknown } | null> {
     const missing = (s: string): boolean =>
@@ -146,7 +146,7 @@ export class NearRpcClient {
       });
       if (r.permission !== undefined) return { permission: r.permission };
       if (typeof r.error === "string" && missing(r.error)) return null;
-      throw new RpcError({ code: -32603, message: "view_access_key tanpa permission" });
+      throw new RpcError({ code: -32603, message: "view_access_key missing permission" });
     } catch (err) {
       if (err instanceof RpcError && missing(`${err.rpcError.message} ${JSON.stringify(err.rpcError.data ?? "")}`)) {
         return null;
@@ -160,7 +160,7 @@ export class NearRpcClient {
   }
 }
 
-/** True bila error RPC berarti akun/kontrak belum ada (jangan mengarang data). */
+/** True when the RPC error indicates the account/contract is not deployed (never fabricate data). */
 export function isContractNotDeployed(err: unknown): boolean {
   if (!(err instanceof RpcError)) return false;
   const s = `${err.rpcError.message} ${JSON.stringify(err.rpcError.data ?? "")}`;

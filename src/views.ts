@@ -1,7 +1,7 @@
 /**
- * Pemetaan view kontrak -> route baca-saja (VC-020, INT-105..106).
- * Semua data dari view kontrak (`snacc-v001.*`) lewat RPC; nama field disalin persis
- * dari `contracts/snacc/src/{lib,state}.rs`. Tidak ada angka yang dikarang/dihitung ulang.
+ * Contract view -> read-only route mapping (VC-020, INT-105..106).
+ * All data comes from contract views (`snacc-v001.*`) via RPC; field names are copied verbatim
+ * from `contracts/snacc/src/{lib,state}.rs`. No numbers are fabricated or recomputed.
  */
 
 import {
@@ -14,13 +14,13 @@ import { STRAIN_U128_FIELDS, type StrainVesselView } from "./macro.js";
 
 export type NotDeployed = { error: "contract_not_deployed" };
 
-/** Batas enumerasi strain per permintaan (jaga beban RPC publik). */
+/** Maximum strains enumerated per request (protects public RPC load). */
 export const MAX_STRAINS_LISTED = 200;
 const FETCH_CONCURRENCY = 8;
-/** Jumlah epoch dividen terakhir yang rate-nya ditampilkan. */
+/** Number of recent closed dividend epochs whose rates are returned. */
 export const DIVIDEND_RATE_WINDOW = 24;
 
-/** NEAR account id: 2..64 karakter, [a-z0-9] dengan pemisah `-`, `_`, `.`. */
+/** NEAR account id: 2..64 chars, [a-z0-9] separated by `-`, `_`, `.`. */
 const ACCOUNT_ID_RE = /^(?=.{2,64}$)[a-z0-9]+([-_.][a-z0-9]+)*$/;
 export function isValidAccountId(id: string): boolean {
   return ACCOUNT_ID_RE.test(id);
@@ -45,7 +45,7 @@ async function view(
   return { text: r.text, block_height: r.block_height };
 }
 
-/** Bungkus panggilan view: akun kontrak tidak ada -> `contract_not_deployed`. */
+/** Wrap view call: missing contract account -> `contract_not_deployed`. */
 async function guarded<T>(fn: () => Promise<T>): Promise<T | NotDeployed> {
   try {
     return await fn();
@@ -56,7 +56,7 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T | NotDeployed> {
 }
 
 // ---------------------------------------------------------------------------
-// /api/strains — enumerasi dari view (bukan dari poller event)
+// /api/strains — enumeration from contract views (not from the event poller)
 // ---------------------------------------------------------------------------
 
 export interface StrainListResponse {
@@ -84,9 +84,9 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R
 }
 
 /**
- * Daftar seluruh Strain: `nft_total_supply` (id 1..N berurutan, token Liquidated/SplicedBurned
- * tetap ada) lalu `get_strain` per id. Menggantikan sumber event-cache yang tak pernah terisi
- * (RPC `chunk` tidak membawa log eksekusi).
+ * List all Strains: `nft_total_supply` (sequential IDs 1..N; Liquidated/SplicedBurned tokens
+ * remain in state) followed by `get_strain` per ID. Replaces the event-cache source that was never populated
+ * (RPC `chunk` does not carry execution logs).
  */
 export async function fetchStrainList(
   client: NearRpcClient,
@@ -96,7 +96,7 @@ export async function fetchStrainList(
     const supply = await view(client, contractId, "nft_total_supply", {});
     const total = Number(JSON.parse(supply.text) as string);
     if (!Number.isInteger(total) || total < 0) {
-      throw new Error(`nft_total_supply tidak valid: ${supply.text}`);
+      throw new Error(`invalid nft_total_supply: ${supply.text}`);
     }
     const n = Math.min(total, MAX_STRAINS_LISTED);
     const ids = Array.from({ length: n }, (_, i) => i + 1);
@@ -105,7 +105,7 @@ export async function fetchStrainList(
         const r = await view(client, contractId, "get_strain", { strain_id: id });
         return JSON.parse(quoteU128Fields(r.text, STRAIN_U128_FIELDS)) as StrainVesselView;
       } catch (err) {
-        if (err instanceof ViewPanicError) return null; // id tidak ada (celah urutan)
+        if (err instanceof ViewPanicError) return null; // ID does not exist (sequence gap)
         throw err;
       }
     });
@@ -124,7 +124,7 @@ export async function fetchStrainList(
 }
 
 // ---------------------------------------------------------------------------
-// /api/strains/:id/svg — SVG NEP-177 dari nft_token
+// /api/strains/:id/svg — NEP-177 SVG from nft_token
 // ---------------------------------------------------------------------------
 
 const SVG_DATA_URI_PREFIX = "data:image/svg+xml;base64,";
@@ -272,7 +272,7 @@ export async function fetchAppetite(
 }
 
 // ---------------------------------------------------------------------------
-// /api/zones — zona sekarang (view) + riwayat zone_changed (event cache)
+// /api/zones — current zone (view) + zone_changed history (event cache)
 // ---------------------------------------------------------------------------
 
 export interface ZonesResponse {
@@ -322,7 +322,7 @@ export async function fetchZones(
       history: zoneEvents,
       history_complete: false as const,
       history_note:
-        "Riwayat zone_changed hanya event yang tertangkap poller sejak proses mulai; kontrak tidak menyediakan view riwayat zona.",
+        "zone_changed history only includes events captured by the poller since process start; the contract does not expose a zone history view.",
       contractId,
       blockHeight: meter.block_height,
     };

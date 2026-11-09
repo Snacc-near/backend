@@ -1,8 +1,8 @@
 /**
- * Ekstraksi event NEP-297 dari log eksekusi (INT-104).
- * Mendukung dua format yang dipancarkan kontrak (lihat sdk/src/events.ts):
- *  - JSON telanjang {"kind": "...", ...}
- *  - EVENT_JSON:{standard:"neardak-event"...} pembungkus baku (VC-010)
+ * NEP-297 event extraction from execution logs (INT-104).
+ * Supports both formats emitted by the contract (see sdk/src/events.ts):
+ *  - Bare JSON {"kind": "...", ...}
+ *  - Standard EVENT_JSON:{standard:"neardak-event"...} wrapper (VC-010)
  */
 
 export interface CrucibleEvent {
@@ -20,7 +20,7 @@ function parseEventObject(obj: unknown): Record<string, unknown> | null {
   return rec;
 }
 
-/** Ambil event dari satu daftar log. Log tanpa JSON event diabaikan. */
+/** Extract events from a single log array. Logs without event JSON are ignored. */
 export function extractEventsFromLogs(logs: string[]): CrucibleEvent[] {
   const out: CrucibleEvent[] = [];
   for (const log of logs) {
@@ -34,7 +34,7 @@ export function extractEventsFromLogs(logs: string[]): CrucibleEvent[] {
     for (const cand of candidates) {
       try {
         const parsed = JSON.parse(cand) as unknown;
-        // pembungkus NEP-297: { standard, event, data: [ {...} ] }
+        // NEP-297 wrapper: { standard, event, data: [ {...} ] }
         const dataArr = (parsed as Record<string, unknown>)?.["data"];
         if (Array.isArray(dataArr)) {
           for (const item of dataArr) {
@@ -46,7 +46,7 @@ export function extractEventsFromLogs(logs: string[]): CrucibleEvent[] {
         const ev = parseEventObject(parsed);
         if (ev) out.push({ kind: String(ev["kind"]), raw: ev });
       } catch {
-        // log non-JSON — abaikan
+        // non-JSON log — ignore
       }
     }
   }
@@ -63,7 +63,7 @@ export function newEventStore(): EventStore {
   return { events: [], strainsSeen: new Map(), indexerComplete: false };
 }
 
-/** Simpan event ke store; catat strain_created untuk list /api/strains. */
+/** Store an event in memory; record strain_created for /api/strains fallback tracking. */
 export function absorbEvent(store: EventStore, ev: CrucibleEvent): void {
   store.events.push(ev);
   if (ev.kind === "strain_created") {
@@ -74,7 +74,7 @@ export function absorbEvent(store: EventStore, ev: CrucibleEvent): void {
   }
 }
 
-/** Fungsi murni: kumpulkan event dari hasil RPC `chunk` (mudah diuji). */
+/** Pure function: collect events from an RPC `chunk` result (easy to unit test). */
 export function collectEventsFromChunk(chunk: {
   receipts: Array<{ receipt_id: string; outcome: { logs: string[] } }>;
 }): CrucibleEvent[] {
