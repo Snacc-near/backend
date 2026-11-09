@@ -4,68 +4,80 @@ import {
   pollOnce,
   absorbTxOutcome,
   newPollerState,
-  indexerLagBlocks,
-  MAX_BLOCKS_PER_TICK,
+  BACKOFF_BASE_MS,
+  BACKOFF_MAX_MS,
   type PollerRpc,
   type PollerState,
 } from "../src/poller.js";
 import { newEventStore, MAX_EVENTS, absorbEvent, type CrucibleEvent, type EventStore } from "../src/events.js";
-import { RpcError } from "../src/near.js";
+
+const CONTRACT = "snacc-v001.testnet";
 
 interface Fixture {
-  client: PollerRpc;
-  blocks: Record<number, string[]>; // height -> chunk ids (mutate to advance the chain)
-  chunks: Record<
-    string,
-    {
-      receipts?: Array<{ receipt_id: string; outcome: { logs: string[] } }>;
-      transactions?: Array<{ hash: string; receiver_id: string; signer_id: string }>;
-    }
-  >;
-  txOutcomes: Record<string, unknown>; // tx hash -> `tx` result
-  calls: string[];
+  rpc: PollerRpc;
+  discovery: { calls: number; responses: Array<{ status: number; body?: unknown } | Error> };
+  txOutcomes: Record<string, unknown>;
+  blocks: Record<number, string[]>;
+  blockCalls: number;
 }
 
-/** Stub client that answers `block`/`chunk`/`tx` from fixtures — no network. */
-function fixtureClient(
+/** Stub sources: a discovery fetch + a NEAR RPC stub (`block`, `tx`) — no network. */
+function fixture(
+  discoveryResponses: Array<{ status: number; body?: unknown } | Error>,
   blocks: Record<number, string[]>,
-  chunks: Fixture["chunks"],
   txOutcomes: Record<string, unknown> = {},
-  opts: { failOn?: string; rpcError?: { code: number; message: string } } = {},
+  opts: { failTxOn?: string[] } = {},
 ): Fixture {
-  const calls: string[] = [];
-  const head = () => Math.max(...Object.keys(blocks).map(Number));
-  const client: PollerRpc = {
+  const f: Fixture = {
+    rpc: null as unknown as PollerRpc,
+    discovery: { calls: 0, responses: [...discoveryResponses] },
+    txOutcomes,
+    blocks,
+    blockCalls: 0,
+  };
+  const headHeight = () => Math.max(0, ...Object.keys(blocks).map(Number));
+  f.rpc = {
     async fetchJsonRpc<T>(method: string, params: unknown): Promise<T> {
-      calls.push(`${method}:${JSON.stringify(params)}`);
-      if (opts.failOn && method === opts.failOn) {
-        throw new RpcError(opts.rpcError ?? { code: -32000, message: "HTTP 429 from RPC" });
-      }
       if (method === "block") {
+        f.blockCalls++;
         const p = params as { finality?: string; block_id?: number };
-        const height = p.finality === "final" ? head() : p.block_id!;
-        const chunk_ids = blocks[height];
-        if (!chunk_ids) throw new RpcError({ code: -32000, message: `block ${height} not found` });
-        // The real RPC block result: header.height + chunks[] with chunk_hash per shard.
-        return { header: { height }, chunks: chunk_ids.map((id) => ({ chunk_hash: id })) } as T;
-      }
-      if (method === "chunk") {
-        const p = params as { chunk_id: string };
-        return { header: { height: 0, chunk_hash: p.chunk_id }, ...chunks[p.chunk_id] } as T;
+        const height = p.finality === "final" ? headHeight() : p.block_id!;
+        const chunks = blocks[height];
+        if (chunks === undefined) throw new Error(`block ${height} not found`);
+        return { header: { height }, chunks: chunks.map((id) => ({ chunk_hash: id })) } as T;
       }
       if (method === "tx") {
         const p = params as [string, string];
-        const out = txOutcomes[p[0]];
-        if (!out) throw new RpcError({ code: -32000, message: "tx not found" });
+        if (opts.failTxOn?.includes(p[0])) throw new Error("HTTP 429 from RPC");
+        const out = f.txOutcomes[p[0]];
+        if (!out) throw new Error("tx not found");
         return out as T;
       }
       throw new Error(`unexpected method ${method}`);
     },
   };
-  return { client, blocks, chunks, txOutcomes, calls };
+  return f;
 }
 
-const CONTRACT = "snacc-v001.testnet";
+function discoveryFetchOf(fx: Fixture) {
+  return async (url: string) => {
+    fx.discovery.calls++;
+    const next = fx.discovery.responses.shift();
+    if (!next) return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    if (next instanceof Error) throw next;
+    if (typeof next.body === "undefined") return { ok: false, status: next.status, json: async () => ({}) };
+    return { ok: true, status: next.status, json: async () => next.body };
+  };
+}
+
+const discoveryTx = (hash: string, height: number, tsNs: string, receiver = CONTRACT) => ({
+  transaction_hash: hash,
+  receiver_account_id: receiver,
+  signer_account_id: "user.testnet",
+  block_timestamp: tsNs,
+  block: { block_height: String(height) },
+});
+
 const FED_EVENT = 'EVENT_JSON:{"standard":"snacc","version":"1.0.0","event":"fed","data":[{"kind":"fed","strain_id":1,"effective_fee":900,"atp_minted":2}]}';
 const CALLBACK_EVENT = 'EVENT_JSON:{"standard":"snacc","version":"1.0.0","event":"subaccount_materialized","data":[{"kind":"subaccount_materialized","strain_id":1,"sub_account_id":"s-1-0.snacc-v001.testnet"}]}';
 
@@ -75,64 +87,197 @@ const txOutcome = (txLogs: string[], receiptLogs: string[][]) => ({
   transaction: { hash: "T1" },
 });
 
-test("first poll starts at the head, reads the contract's txs, and absorbs their events", async () => {
-  const fx = fixtureClient(
-    { 100: ["c100"] },
-    {
-      c100: {
-        transactions: [
-          { hash: "T1", receiver_id: CONTRACT, signer_id: "user.testnet" },
-          { hash: "TX-other", receiver_id: "other.testnet", signer_id: "user.testnet" }, // not our contract
-        ],
-      },
-    },
-    {
-      T1: txOutcome([FED_EVENT], [[CALLBACK_EVENT]]),
-    },
+test("backfill: the first discovery call fetches 50 and queues every new tx (budget 5/tick)", async () => {
+  const data = Array.from({ length: 12 }, (_, i) =>
+    discoveryTx(`T${i}`, 100 + i, String(1000 + i)),
+  ).reverse(); // newest first
+  const fx = fixture([], { 112: ["c"] },
+    Object.fromEntries(data.map((t) => [t.transaction_hash, txOutcome([FED_EVENT], [])])),
   );
+  const responses = [{ status: 200, body: { data } }, { status: 200, body: { data: [] } }, { status: 200, body: { data: [] } }];
+  let requestedUrl = "";
+  const fetchSpy = async (url: string) => {
+    requestedUrl = url;
+    fx.discovery.calls++;
+    const next = responses.shift() ?? { status: 200, body: { data: [] } };
+    return { ok: true, status: 200, json: async () => next.body };
+  };
   const store = newEventStore();
   const state = newPollerState();
-  await pollOnce(fx.client, CONTRACT, store, state);
-  assert.equal(state.headHeight, 100);
-  assert.equal(state.cursorHeight, 100);
+
+  await pollOnce(fx.rpc, fetchSpy, CONTRACT, store, state, 1000);
+  assert.match(requestedUrl, /limit=50/); // backfill page size on the first tick
+  assert.match(requestedUrl, /nearblocks\.io\/v3\/accounts\/snacc-v001\.testnet\/txns/);
+  assert.equal(state.queue.length, 7); // 12 discovered − 5 absorbed (the budget)
+  assert.equal(store.events.length, 5);
+  assert.equal(state.processedTx, 5);
+  assert.equal(state.caughtUp, false); // the queue is not drained yet → honest incomplete
+  assert.equal(store.indexerComplete, false);
+  assert.equal(state.cursorHeight, 104); // the 5 oldest absorbed (the queue drains oldest-first)
+  assert.equal(state.lagBlocks, 8);
+  assert.equal(state.rateLimitedErrors, 0);
+
+  // Drain: 7 remaining → 5 + 2 → drained; the cursor reaches the newest.
+  await pollOnce(fx.rpc, fetchSpy, CONTRACT, store, state, 2000);
+  assert.equal(state.queue.length, 2);
+  await pollOnce(fx.rpc, fetchSpy, CONTRACT, store, state, 3000);
+  assert.equal(state.queue.length, 0);
+  assert.equal(store.events.length, 12);
+  assert.equal(state.cursorTimestampNs, "1011");
+  assert.equal(state.cursorHeight, 111);
   assert.equal(state.caughtUp, true);
   assert.equal(store.indexerComplete, true);
-  assert.equal(state.processedTx, 1); // only the contract's own tx
-  assert.deepEqual(store.events.map((e) => e.kind), ["fed", "subaccount_materialized"]);
-  assert.equal(store.events[0]!.block_height, 100);
-  assert.deepEqual([...state.recheck], ["T1"]);
-  assert.equal(indexerLagBlocks(state), 0);
+  assert.equal(state.lagBlocks, 1);
 });
 
-test("the recheck pass on the next tick absorbs delayed callback receipts without duplicates", async () => {
-  const fx = fixtureClient(
-    { 100: ["c100"] },
-    { c100: { transactions: [{ hash: "T1", receiver_id: CONTRACT, signer_id: "u.testnet" }] } },
+test("the cursor skips already-discovered txs on later ticks (no duplicates, 1 discovery call/tick)", async () => {
+  const data = [discoveryTx("T2", 105, "2005"), discoveryTx("T1", 104, "2004")];
+  const fx = fixture(
+    [
+      { status: 200, body: { data } },
+      { status: 200, body: { data } }, // the same list is returned again (the source is newest-first)
+      { status: 200, body: { data } },
+    ],
+    { 105: ["c"] },
     {
-      T1: txOutcome([FED_EVENT], []), // the callback receipt does not exist yet
+      T1: txOutcome([FED_EVENT], []),
+      T2: txOutcome([CALLBACK_EVENT], []),
     },
   );
+  const fetch = discoveryFetchOf(fx);
   const store = newEventStore();
   const state = newPollerState();
-  await pollOnce(fx.client, CONTRACT, store, state);
-  assert.deepEqual(store.events.map((e) => e.kind), ["fed"]);
-
-  // Next tick: the delayed callback receipt is now visible; the head also advanced with a new tx.
-  fx.txOutcomes["T1"] = txOutcome([FED_EVENT], [[CALLBACK_EVENT]]);
-  fx.blocks[101] = ["c101"];
-  fx.chunks["c101"] = { transactions: [{ hash: "T2", receiver_id: CONTRACT, signer_id: "u.testnet" }] };
-  fx.txOutcomes["T2"] = txOutcome([FED_EVENT], []);
-  await pollOnce(fx.client, CONTRACT, store, state);
-  assert.deepEqual(store.events.map((e) => e.kind), [
-    "fed",
-    "subaccount_materialized", // from the T1 recheck
-    "fed", // T2
-  ]);
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
+  assert.equal(store.events.length, 2);
+  assert.equal(state.cursorTimestampNs, "2005");
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 2000);
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 3000);
+  assert.equal(fx.discovery.calls, 3); // exactly 1 discovery call per tick
+  assert.equal(store.events.length, 2); // no duplicates
   assert.equal(state.processedTx, 2);
-  assert.deepEqual(state.recheck, ["T2"]);
-  // The fed event from T1 was NOT re-absorbed (receipt-level dedupe).
-  assert.equal(store.events.length, 3);
   assert.equal(state.caughtUp, true);
+});
+
+test("a discovery 429 arms the global backoff: the next ticks make zero API calls", async () => {
+  const fx = fixture(
+    [{ status: 429 }, { status: 200, body: { data: [] } }],
+    { 105: ["c"] },
+  );
+  const fetch = discoveryFetchOf(fx);
+  const store = newEventStore();
+  const state = newPollerState();
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
+  assert.equal(state.rateLimitedErrors, 1);
+  assert.equal(state.backoffUntilMs, 1000 + BACKOFF_BASE_MS * 2);
+  assert.equal(store.indexerComplete, false);
+  assert.match(state.lastError ?? "", /discovery HTTP 429/);
+
+  // Inside the backoff window: no API calls at all.
+  const before = fx.discovery.calls + fx.blockCalls;
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000 + BACKOFF_BASE_MS);
+  assert.equal(fx.discovery.calls + fx.blockCalls, before); // zero calls while backing off
+  assert.equal(state.backedOffTicks, 1);
+
+  // After the backoff expires the poll resumes and the backoff counter resets on success.
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000 + BACKOFF_BASE_MS * 2 + 1);
+  assert.equal(state.rateLimitedErrors, 1);
+  assert.equal(state.backoffAttempts, 0);
+  assert.equal(state.caughtUp, true);
+  assert.equal(store.indexerComplete, true);
+});
+
+test("a tx-level 429 re-queues the tx and keeps the cursor (no silent loss)", async () => {
+  const fx = fixture(
+    [{ status: 200, body: { data: [discoveryTx("T1", 104, "2004")] } }],
+    { 104: ["c"] },
+    {}, // T1 will fail
+    { failTxOn: ["T1"] },
+  );
+  const fetch = discoveryFetchOf(fx);
+  const store = newEventStore();
+  const state = newPollerState();
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
+  assert.equal(state.rateLimitedErrors, 1);
+  assert.match(state.lastError ?? "", /T1.*429/);
+  assert.equal(state.queue.length, 1); // re-queued
+  assert.equal(state.cursorTimestampNs, null); // not absorbed → cursor unchanged
+  assert.equal(store.indexerComplete, false);
+
+  // Next tick (after backoff): the same tx is retried and absorbed (a healthy RPC this time).
+  fx.txOutcomes["T1"] = txOutcome([FED_EVENT], [[CALLBACK_EVENT]]);
+  const healthy = fixture([], fx.blocks, fx.txOutcomes);
+  const responses2 = [{ status: 200, body: { data: [] } }];
+  const fetch2 = async (url: string) => {
+    healthy.discovery.calls++;
+    const next = responses2.shift() ?? { status: 200, body: { data: [] } };
+    void url;
+    return { ok: true, status: 200, json: async () => next.body };
+  };
+  await pollOnce(healthy.rpc, fetch2, CONTRACT, store, state, 1000 + BACKOFF_BASE_MS * 2 + 1);
+  assert.equal(state.processedTx, 1);
+  assert.deepEqual(store.events.map((e) => e.kind), ["fed", "subaccount_materialized"]);
+  assert.equal(state.cursorHeight, 104);
+  assert.equal(state.caughtUp, true);
+});
+
+test("backoff grows exponentially and is capped", async () => {
+  const fx = fixture(
+    Array.from({ length: 8 }, () => ({ status: 429 }) as { status: number }),
+    { 105: ["c"] },
+  );
+  const fetch = discoveryFetchOf(fx);
+  const store = newEventStore();
+  const state = newPollerState();
+  let now = 1000;
+  for (let i = 1; i <= 6; i++) {
+    await pollOnce(fx.rpc, fetch, CONTRACT, store, state, now);
+    const expectedDelay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** i);
+    assert.equal(state.backoffUntilMs, now + expectedDelay);
+    now = state.backoffUntilMs + 1; // the next poll happens after the backoff expires
+  }
+  assert.equal(state.backoffAttempts, 6);
+  assert.equal(state.rateLimitedErrors, 6);
+});
+
+test("a quiet contract: the lag stays fresh and the discovery is still 1 call/tick", async () => {
+  const fx = fixture(
+    [
+      { status: 200, body: { data: [discoveryTx("T1", 100, "1000")] } },
+      { status: 200, body: { data: [] } },
+      { status: 200, body: { data: [] } },
+    ],
+    { 100: ["c"] },
+    { T1: txOutcome([FED_EVENT], []) },
+  );
+  const fetch = discoveryFetchOf(fx);
+  const store = newEventStore();
+  const state = newPollerState();
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
+  assert.equal(state.lagBlocks, 0);
+  fx.blocks[101] = ["c"];
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 2000);
+  fx.blocks[130] = ["c"]; // the chain advances 29 blocks with no contract txs
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 3000);
+  assert.equal(state.headHeight, 130);
+  assert.equal(state.lagBlocks, 30); // honest: the newest known contract activity is 30 blocks behind the head
+  assert.equal(state.caughtUp, true); // the discovery source is healthy — nothing new to fetch
+  assert.equal(store.indexerComplete, true);
+});
+
+test("irrelevant accounts in the discovery feed are filtered out", async () => {
+  const data = [
+    discoveryTx("T-other", 105, "2005", "someone-else.testnet"),
+    discoveryTx("T-ours", 104, "2004"),
+  ];
+  const fx = fixture([{ status: 200, body: { data } }], { 105: ["c"] }, {
+    "T-ours": txOutcome([FED_EVENT], []),
+  });
+  const fetch = discoveryFetchOf(fx);
+  const store = newEventStore();
+  const state = newPollerState();
+  await pollOnce(fx.rpc, fetch, CONTRACT, store, state, 1000);
+  assert.equal(state.processedTx, 1);
+  assert.equal(store.events.length, 1);
 });
 
 test("absorbTxOutcome does not re-absorb already-seen receipts", () => {
@@ -142,54 +287,6 @@ test("absorbTxOutcome does not re-absorb already-seen receipts", () => {
   assert.equal(absorbTxOutcome(store, state, "T1", result, 5), 2);
   assert.equal(absorbTxOutcome(store, state, "T1", result, 5), 0);
   assert.equal(store.events.length, 2);
-});
-
-test("catch-up is bounded by MAX_BLOCKS_PER_TICK per poll", async () => {
-  const blocks: Record<number, string[]> = {};
-  for (let h = 100; h <= 120; h++) blocks[h] = [];
-  const fx = fixtureClient(blocks, {});
-  const store = newEventStore();
-  const state: PollerState = newPollerState();
-  await pollOnce(fx.client, CONTRACT, store, state); // cursor = 120 (the head)
-  assert.equal(state.cursorHeight, 120);
-
-  // The head jumps 60 blocks ahead (> MAX_BLOCKS_PER_TICK).
-  for (let h = 121; h <= 180; h++) fx.blocks[h] = [];
-  await pollOnce(fx.client, CONTRACT, store, state); // processes 121..170 only (50 blocks)
-  assert.equal(state.cursorHeight, 170);
-  assert.equal(state.caughtUp, false);
-  assert.equal(indexerLagBlocks(state), 10);
-  await pollOnce(fx.client, CONTRACT, store, state); // finishes the tail 171..180
-  assert.equal(state.cursorHeight, 180);
-  assert.equal(state.caughtUp, true);
-  assert.equal(indexerLagBlocks(state), 0);
-});
-
-test("RPC failure (429 after retries) keeps the cursor and marks the store incomplete", async () => {
-  const fx = fixtureClient(
-    { 100: ["c100"] },
-    { c100: { transactions: [{ hash: "T1", receiver_id: CONTRACT, signer_id: "u.testnet" }] } },
-    { T1: txOutcome([FED_EVENT], []) },
-  );
-  const store = newEventStore();
-  const state = newPollerState();
-  await pollOnce(fx.client, CONTRACT, store, state);
-  assert.equal(state.cursorHeight, 100);
-  assert.equal(store.indexerComplete, true);
-
-  // The head advances to 101 with a contract tx, but `tx` calls now return 429.
-  fx.blocks[101] = ["c101"];
-  fx.chunks["c101"] = { transactions: [{ hash: "T2", receiver_id: CONTRACT, signer_id: "u.testnet" }] };
-  const failing = fixtureClient(fx.blocks, fx.chunks, fx.txOutcomes, {
-    failOn: "tx",
-    rpcError: { code: -32000, message: "HTTP 429 from RPC" },
-  });
-  await assert.rejects(pollOnce(failing.client, CONTRACT, store, state), /429/);
-  assert.equal(state.cursorHeight, 100); // unchanged — no skip
-  assert.equal(state.caughtUp, false);
-  assert.match(state.lastError ?? "", /429/);
-  assert.equal(store.indexerComplete, false); // honest: incomplete while failing
-  assert.equal(store.events.length, 1);
 });
 
 test("the in-memory store drops the oldest events beyond MAX_EVENTS", () => {

@@ -9,7 +9,7 @@ import { IncomingMessage } from "node:http";
 import { NearRpcClient, RpcError } from "./near.js";
 import { fetchMacroState, fetchStrain } from "./macro.js";
 import { EventStore, newEventStore } from "./events.js";
-import { indexerLagBlocks, type PollerState } from "./poller.js";
+import { type PollerState } from "./poller.js";
 import {
   fetchAppetite,
   fetchColony,
@@ -179,7 +179,11 @@ async function routeInner(req: IncomingMessage, deps: RouterDeps): Promise<Route
 
   if (pathname === "/api/events") {
     // The spec does not define a lag body field, so the lag goes in a response header only.
-    const lag = deps.poller ? indexerLagBlocks(deps.poller) : null;
+    // Meaning (poller v2): chain head − the block of the newest contract tx absorbed;
+    // it grows when the contract is quiet (no recent activity) — the health signal is
+    // `indexer_incomplete`, which is true while the discovery source fails/backing off
+    // or the backfill queue is not drained.
+    const lag = deps.poller?.lagBlocks ?? null;
     return {
       status: 200,
       body: {
