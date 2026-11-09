@@ -1,5 +1,5 @@
 /**
- * Server bootstrap (INT-101). Env: PORT, CONTRACT_ID, RPC_URL, POLL_INTERVAL_MS, NEAR_AI_API_KEY (optional, VC-015).
+ * Server bootstrap (INT-101). Env: PORT, CONTRACT_ID, RPC_URLS (or legacy RPC_URL), POLL_INTERVAL_MS, NEAR_AI_API_KEY (optional, VC-015).
  * Without env -> defaults to testnet + dictionary contract snacc-v001.testnet.
  */
 
@@ -11,10 +11,19 @@ import { newEvaluateState, type EvaluateDeps } from "./evaluate.js";
 
 const PORT = Number(process.env["PORT"] ?? 8787);
 const CONTRACT_ID = process.env["CONTRACT_ID"] ?? "snacc-v001.testnet";
-const RPC_URL = process.env["RPC_URL"] ?? "https://test.rpc.fastnear.com"; // rpc.testnet.near.org deprecated (HTTP 429)
+// Public testnet RPCs rate-limit per source IP, so a single endpoint is not enough:
+// `rpc.testnet.near.org` mostly answers 429 from cloud IPs, `near-testnet.lava.build` is gone
+// (HTTP 410) and `rpc.testnet.pagoda.co` requires auth (403). The client rotates a LIST of
+// endpoints (INT-104): `RPC_URLS` (comma-separated), with `RPC_URL` kept as a legacy fallback.
+const RPC_URLS = (
+  process.env["RPC_URLS"] ?? process.env["RPC_URL"] ?? "https://near-testnet.drpc.org,https://test.rpc.fastnear.com"
+)
+  .split(",")
+  .map((u) => u.trim())
+  .filter((u) => u.length > 0);
 const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 15000);
 
-const rpc = new NearRpcClient(RPC_URL);
+const rpc = new NearRpcClient(RPC_URLS);
 const store = newStore();
 const pollerState = newPollerState();
 // VC-015: NEAR AI key comes strictly from server env; never logged or returned. Empty -> 503 tee_not_configured.
@@ -37,7 +46,7 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`snacc-backend listening on :${PORT}, contract=${CONTRACT_ID}, rpc=${RPC_URL}`);
+  console.log(`snacc-backend listening on :${PORT}, contract=${CONTRACT_ID}, rpc=${RPC_URLS.join(",")}`);
 });
 
 // Event poller v2 (INT-102/INT-104): discovery via the NearBlocks v3 account feed (1 call per

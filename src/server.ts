@@ -81,13 +81,29 @@ export function corsHeaders(method: string | undefined): Record<string, string> 
   if (method !== "GET" && method !== "HEAD") return {};
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers": "x-indexer-lag-blocks",
+    "Access-Control-Expose-Headers": "x-indexer-lag-blocks, x-data-stale-seconds",
   };
+}
+
+/**
+ * When a view was served stale from the cache (every RPC endpoint failing), the response
+ * carries `x-data-stale-seconds` so consumers know the data's age — the data itself is never
+ * fabricated, only labelled.
+ */
+export function staleHeaderFor(body: unknown): Record<string, string> {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const s = (body as Record<string, unknown>)["staleSeconds"];
+    if (typeof s === "number" && Number.isFinite(s) && s >= 0) {
+      return { "x-data-stale-seconds": String(Math.floor(s)) };
+    }
+  }
+  return {};
 }
 
 export async function route(req: IncomingMessage, deps: RouterDeps): Promise<RouterResult> {
   try {
-    return await routeInner(req, deps);
+    const result = await routeInner(req, deps);
+    return { ...result, headers: { ...staleHeaderFor(result.body), ...result.headers } };
   } catch (err) {
     if (err instanceof RpcError) {
       return { status: 503, body: { error: "rpc_unavailable", message: err.message } };
