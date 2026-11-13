@@ -17,6 +17,9 @@ verify_jwt = true
 [functions.track]
 verify_jwt = false
 
+[functions.chain-index]
+verify_jwt = false
+
 # UI-160 Web Push: subscribe/unsubscribe/key need a Supabase JWT; push-dispatch is cron-driven (x-cron-secret).
 [functions.push]
 verify_jwt = true
