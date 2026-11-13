@@ -49,8 +49,9 @@ declare
   got text;
   streak integer;
 begin
+  -- quest_* badges (UI-153) depend on which three daily quests the date picks: covered by snacc_quests_seasons.sql
   select string_agg(code, ',' order by code) into got
-  from public.achievements_snacc where user_id = 'aaaaaaaa-5acc-4000-8000-000000000001';
+  from public.achievements_snacc where user_id = 'aaaaaaaa-5acc-4000-8000-000000000001' and code not like 'quest\_%';
   if got is distinct from 'first_feed,first_hatch,gifter,streak_3' then
     raise exception 'FAIL achievements: expected first_feed,first_hatch,gifter,streak_3, got %', got;
   end if;
@@ -109,7 +110,7 @@ begin
   if (select count(*) from public.activity_snacc where near_account_id = 'rls-check-a.testnet') <> 5 then
     raise exception 'FAIL anon cannot read activity_snacc';
   end if;
-  if (select count(*) from public.achievements_snacc where user_id = 'aaaaaaaa-5acc-4000-8000-000000000001') <> 4 then
+  if (select count(*) from public.achievements_snacc where user_id = 'aaaaaaaa-5acc-4000-8000-000000000001' and code not like 'quest\_%') <> 4 then
     raise exception 'FAIL anon cannot read achievements_snacc';
   end if;
   if (select current_streak_days from public.streaks_snacc where user_id = 'aaaaaaaa-5acc-4000-8000-000000000001') is distinct from 3 then

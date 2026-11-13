@@ -27,7 +27,9 @@ pg_cron (every 10 min) ─► POST /notify-scan (x-cron-secret) ─► nft_token
 | --- | --- |
 | `migrations/20261113000001_snacc_core.sql` | tables, RLS, grants, achievements trigger, views, realtime |
 | `migrations/20261113000002_snacc_cron.sql` | inert (`select 1`); the `pg_cron` schedule is in comments, enable by hand |
+| `migrations/20261113000004_snacc_quests_seasons.sql` | daily quests, XP and level, weekly seasons, season leaderboard, hall of fame, two quest badges (UI-153, UI-154) |
 | `tests/snacc_rls.sql` | RLS/privilege assertions in one rolled-back transaction |
+| `tests/snacc_quests_seasons.sql` | quest/XP/level/season math on sample rows, plus privileges and row-level security of the new views (rolled back) |
 | `functions/_shared/*.ts` | pure TypeScript (Web Crypto + fetch only, no `node:` imports, no Deno globals); compiled and unit-tested by the repo's `npm test` |
 | `functions/_deno/db.ts` | Deno-only glue (`Deno.env`, `npm:@supabase/supabase-js@2`) |
 | `functions/<name>/index.ts` | `Deno.serve` entry points: `near-auth`, `record-tx`, `notify-scan`, `starter-pack` |
@@ -53,6 +55,13 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `notification_prefs_snacc` | `user_id` pk, booleans `starving`, `distressed`, `lost`, `dividend`, `starter`, `system` (default true), `updated_at` | – | select/insert/update **own** | user |
 | `achievements_snacc` | pk (`user_id`, `code`), `earned_at` | select | select | only trigger `snacc_award_achievements()` (security definer) on `activity_snacc` insert |
 | `streaks_snacc` (view, `security_invoker`) | `user_id`, `near_account_id`, `current_streak_days`, `last_feed_day` | select | select | – |
+| `quest_catalog_snacc` (view) | `code`, `title`, `blurb`, `methods` text[], `target`, `bonus_xp`; ten fixed quests | select | select | – (static) |
+| `quest_days_snacc` (view, `security_invoker`) | per player and UTC day with activity: the three picked quests with `slot`, `progress`, `completed` | select | select | – (computed from `activity_snacc`) |
+| `xp_days_snacc` (view, `security_invoker`) | per player and UTC day: `actions`, `action_xp`, `quests_completed`, `quest_xp`, `xp` | select | select | – |
+| `player_xp_snacc` (view, `security_invoker`) | `total_xp`, `level`, `level_start_xp`, `next_level_xp`, `quests_completed`, `actions` per player | select | select | – |
+| `season_leaderboard_snacc` (view, `security_invoker`) | `season`, `starts_on`, `ends_on` (exclusive), `rank`, `user_id`, `near_account_id`, `xp`, `actions`, `quests_completed` | select | select | – |
+| `hall_of_fame_snacc` (view, `security_invoker`) | top 3 (`rank` 1..3) of every finished season | select | select | – |
+| `snacc_my_quests()` (function, `security invoker`) | today's three quests of `auth.uid()` with `progress`, `completed`, `resets_at` | – | execute | – |
 | `follows_snacc` | pk (`follower`, `followee`) → profiles_snacc, no self-follow | select | select; insert/delete as `follower = auth.uid()` | user |
 | `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
@@ -64,6 +73,39 @@ Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned b
 `gifter` (≥ 1 `nft_transfer`), `colony_5` (≥ 5 `incubate_strain` + `divide_strain`).
 `streaks_snacc.current_streak_days` is the run ending on the last feed day, counted only if that day is
 today or yesterday (UTC), else 0.
+
+Two quest badges are added by migration `0004` (same trigger, same table): `quest_first` (first completed
+quest) and `quest_streak_7` (at least one completed quest on seven consecutive UTC days). The migration also
+awards them retroactively for activity recorded earlier (idempotent).
+
+## Quests, XP, level and seasons (UI-153, UI-154)
+
+Everything below is a pure function of the public `activity_snacc` rows that `record-tx` writes after it has
+verified a testnet transaction on-chain. Nothing is client-writable, no table was added, and no cron is
+needed. XP, levels, quests and seasons are **cosmetic and off-chain**: no token, no NEAR, no money value.
+The rules are written out in the header of the migration; the numbers:
+
+- **XP per action** (`snacc_action_xp`): `incubate_strain` 25, `splice_strains` 20, `divide_strain` 15, `adopt` 15,
+  `synthesize_and_redeem_aether` 12, `feed_strain` 10, `synthesize_elixir` 10, `allocate_atp` 8,
+  `transmute_spores_to_enzyme` 8, `extract_spores` 6, `nft_transfer` 5, `npc_buy_spores` 4, any other recorded
+  method 2. Only the first 40 actions of a player per UTC day earn XP (`snacc_xp_daily_action_cap`).
+- **Level**: XP needed for level L is `50 * (L - 1) * L` (L2 100, L3 300, L4 600, L5 1000, L10 4500); no cap.
+- **Daily quests**: three per player per UTC day from `quest_catalog_snacc`, picked by ordering the catalog on
+  `md5(user_id || ':' || day || ':' || code)` (`snacc_quest_rank`), so the set is stable all day and differs
+  between players and days. Progress = the player's `activity_snacc` rows of that UTC day whose `method` is in the
+  quest's `methods`; complete at `progress >= target`; each completed quest adds its `bonus_xp` once. Reset at 00:00 UTC.
+- **Seasons**: Monday 00:00 UTC (inclusive) to the next Monday (exclusive). Season 1 starts on the epoch Monday
+  2026-11-02 (`snacc_season_epoch()`); season n starts on epoch + 7 * (n - 1) days (`snacc_season_start`,
+  `snacc_season_of`, `snacc_current_season`). `season_leaderboard_snacc` ranks players by the XP of the season's UTC
+  days (ties: more quests completed, then account id). `hall_of_fame_snacc` is the top 3 of every finished season.
+- **Privacy**: the views read only `activity_snacc` (public by design; `security_invoker` keeps its RLS), expose only
+  user id, NEAR account id and derived numbers, and have no write privileges for `anon` / `authenticated`.
+  `snacc_my_quests()` filters on `auth.uid()` and is not executable by `anon`.
+- Frontend reads: `snacc_my_quests()` (Quests window), `player_xp_snacc` (level on the profile and in leaderboard
+  rows), `season_leaderboard_snacc` and `hall_of_fame_snacc` (season tab). The TypeScript mirror of the XP, level,
+  catalog and season rules is `functions/_shared/xp.ts`; its unit test also compares it with the migration text.
+- Cost note: the views are computed on read over all activity, which is fine at hackathon scale. If the table grows
+  large, materialize `xp_days_snacc` (for example from the `record-tx` insert) without changing these view contracts.
 
 Player RPCs (`authenticated` only, pinned to `auth.uid()`):
 
@@ -217,7 +259,12 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 1. Apply `migrations/20261113000001_snacc_core.sql` (MCP `apply_migration` or SQL editor). Idempotent;
    creates only `*_snacc` objects and `snacc_*` functions/triggers/policies; never drops anything.
 2. Apply `migrations/20261113000002_snacc_cron.sql` (a no-op that records the file).
+   Then `migrations/20261113000003_snacc_delete_account.sql` and `migrations/20261113000004_snacc_quests_seasons.sql`
+   (idempotent; the latter widens the `achievements_snacc` code check, replaces `snacc_award_achievements()` in place and
+   awards the two quest badges retroactively).
 3. Run `tests/snacc_rls.sql` as `postgres`; expect the notice `ALL SNACC RLS CHECKS PASSED` (it rolls back).
+   Then `tests/snacc_quests_seasons.sql`; expect `ALL SNACC QUEST AND SEASON CHECKS PASSED` (it rolls back too; its
+   fixtures are scoped so real players do not disturb it, and it needs a clock at or after 2026-11-09).
 4. Set the secrets (for the starter pack) `SNACC_FAUCET_ACCOUNT_ID`,
    `SNACC_FAUCET_PRIVATE_KEY`.
 5. Deploy each function together with `_shared/` and `_deno/`:
@@ -242,6 +289,8 @@ Deno-style `.ts` imports into `.js`) and runs:
 - `test/supabase-near-rpc.test.ts`: RPC fallback and error classes, access-key permission parser, tx-status
   parser on real `snacc-v001.testnet` fixtures (`test/fixtures/`), the record-tx handler;
 - `test/supabase-auth.test.ts`: challenge/verify contract, nonce lifecycle, function-call key rejection, CORS;
-- `test/supabase-rules.test.ts`: achievements/streaks, notify-scan planning, starter-pack handler, signer vector.
+- `test/supabase-rules.test.ts`: achievements/streaks, notify-scan planning, starter-pack handler, signer vector;
+- `test/supabase-quests.test.ts`: XP table and daily cap, level curve, quest progress, season boundaries, and a check
+  that `_shared/xp.ts` matches the migration text (XP table, cap, epoch, quest catalog).
 
 The `index.ts` entry points and the SQL are not executed by `npm test`.
