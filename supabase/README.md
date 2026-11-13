@@ -66,6 +66,9 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
 | `scan_queue_snacc` (view, `security_invoker`) | profiles left-joined with scan state | – | – | read by notify-scan |
+| `admins_snacc` | `user_id` pk → profiles_snacc, `added_at` | – | – | service / SQL editor |
+| `blocked_terms_snacc` | `term` pk (`^[a-z]{3,30}$`), `kind` reserved/abusive | – | – | admins via `snacc_admin_block_term()` |
+| `announcements_snacc` | `id`, `title`, `body`, `created_by`, `created_at`, `expires_at` | select (unexpired) | select (unexpired) | admins via `snacc_admin_broadcast()` |
 
 Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned by unit tests):
 `first_hatch` (≥ 1 `incubate_strain`), `first_feed` (≥ 1 `feed_strain`), `feeds_10` (≥ 10 `feed_strain`),
@@ -114,6 +117,19 @@ Player RPCs (`authenticated` only, pinned to `auth.uid()`):
 - `snacc_export_my_data()` (UI-163): one JSON document `snacc-export-v1` with the caller's profile, activity,
   achievements, notifications, notification prefs, the players they follow (public account id + username), a
   follower count, and their starter claim (without `ip_hash`).
+
+Moderation and admin (UI-162, migration `0011`):
+
+- A `before insert or update of username, bio` trigger on `profiles_snacc` refuses a username that equals a
+  reserved word (`admin`, `snacc`, `near`, ... also with trailing digits or digit swaps such as `sn4cc`) and any
+  username or bio that contains a blocked word: error `username_not_allowed` / `bio_not_allowed` (`P0001`, the
+  category is in `detail`). The seed list is short on purpose; admins extend it with `snacc_admin_block_term()`.
+- `snacc_text_violation(text, is_username)` lets the client check a name before saving (`authenticated`).
+- `admins_snacc` (service only) lists admin user ids; `snacc_is_admin()` tells the caller whether they are one.
+- `snacc_admin_broadcast(title, body, days)` writes `announcements_snacc` (public, read-only, expires after
+  `days`) and a `system` notification for every profile with system notifications on.
+- `snacc_admin_reset_profile_text(account)` clears a player's username and bio and notifies them.
+- Every admin RPC raises `admin_only` (`42501`) for non-admins. Test: `tests/snacc_moderation.sql`.
 
 ## HTTP contracts
 
