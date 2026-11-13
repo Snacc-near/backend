@@ -69,6 +69,7 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `admins_snacc` | `user_id` pk → profiles_snacc, `added_at` | – | – | service / SQL editor |
 | `blocked_terms_snacc` | `term` pk (`^[a-z]{3,30}$`), `kind` reserved/abusive | – | – | admins via `snacc_admin_block_term()` |
 | `announcements_snacc` | `id`, `title`, `body`, `created_by`, `created_at`, `expires_at` | select (unexpired) | select (unexpired) | admins via `snacc_admin_broadcast()` |
+| `client_telemetry_snacc` | `kind` event/error, `name`, `device_id`, `session_id`, `route`, `props`, `message`, `stack`, `ip_hash`, `client_at` | – | – | service (track); admins read aggregates via `snacc_admin_metrics()` |
 
 Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned by unit tests):
 `first_hatch` (≥ 1 `incubate_strain`), `first_feed` (≥ 1 `feed_strain`), `feeds_10` (≥ 10 `feed_strain`),
@@ -254,6 +255,18 @@ instead of `npm:near-api-js`. The faucet needs exactly one transaction shape, ne
 dependency tree into every cold start, and the hand-written layout is pinned byte-for-byte to a
 near-api-js 7.4.0 vector in `test/supabase-rules.test.ts`. The key is parsed once, imported as a
 non-extractable `CryptoKey`, and never logged; error messages never include key material.
+
+### `track` (verify_jwt **false**, OPS-127)
+
+`POST /track` from an allowed origin (`ALLOWED_ORIGINS` in `_shared/http.ts`; anything else 403
+`origin_not_allowed`) with `{"deviceId", "sessionId", "events": [{name, route, props, ts}], "errors": [{name,
+message, stack, route, ts}]}` → 202 `{"stored", "rejected"}`. Limits: 16 KB body (413), 20 items, 300 rows per
+hashed client IP per hour (429 `rate_limited`). Event names are allow-listed (`TELEMETRY_EVENTS` in
+`_shared/telemetry.ts`). Stored in `client_telemetry_snacc` (service only): random browser device/session ids,
+a generalised route (`/snacc/:id`, `/p/:account`), allow-listed props, error text scrubbed of keys, JWTs,
+emails, URL queries, NEAR account ids and hashes; no account id, no raw IP. Admins read
+`snacc_admin_metrics(days)`: daily funnel (landing → app → onboarding → wallet → sign-in → first successful tx,
+distinct devices), D1/D7 retention by first-seen day, and the top client errors of the last 7 days.
 
 ## Environment and secrets
 
