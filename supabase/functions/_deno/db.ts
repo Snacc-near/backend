@@ -1,7 +1,7 @@
 // Deno-only glue shared by the Snacc Edge Functions: env, service-role client, caller lookup.
 // Kept out of `_shared/` because it imports supabase-js via `npm:` and uses `Deno.env`.
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
-import { bearerToken, fail, toResponse, type HandlerResult } from "../_shared/http.ts";
+import { bearerToken, fail, safeEqual, toResponse, type HandlerResult } from "../_shared/http.ts";
 
 export function env(name: string): string | undefined {
   const v = Deno.env.get(name);
@@ -29,6 +29,22 @@ export async function nearAccountIdOf(sb: SupabaseClient, userId: string): Promi
   const { data, error } = await sb.from("profiles_snacc").select("near_account_id").eq("user_id", userId).maybeSingle();
   if (error) throw new Error(`profiles_snacc: ${error.message}`);
   return (data as { near_account_id?: string } | null)?.near_account_id ?? null;
+}
+
+/**
+ * Cron-secret check shared by the cron-driven functions (OPS-128): the `x-cron-secret` header is compared with
+ * Supabase Vault through `snacc_cron_secret_ok()`. An explicit `SNACC_CRON_SECRET` edge secret still wins when set.
+ */
+export async function cronSecretCheck(sb: SupabaseClient, name: string, got: string): Promise<"ok" | "bad" | "unavailable"> {
+  if (!got) return "bad";
+  const secret = env("SNACC_CRON_SECRET");
+  if (secret) return safeEqual(got, secret) ? "ok" : "bad";
+  const { data, error } = await sb.rpc("snacc_cron_secret_ok", { candidate: got });
+  if (error) {
+    console.error(`${name}: snacc_cron_secret_ok failed`, error.message);
+    return "unavailable";
+  }
+  return data === true ? "ok" : "bad";
 }
 
 /** Wrap a handler so unexpected errors become a JSON 500 (no stack traces or secrets in the body). */

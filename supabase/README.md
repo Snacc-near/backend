@@ -29,12 +29,14 @@ pg_cron (every 10 min) ─► POST /notify-scan (x-cron-secret) ─► nft_token
 | `migrations/20261113000002_snacc_cron.sql` | inert (`select 1`); the `pg_cron` schedule is in comments, enable by hand |
 | `migrations/20261113000004_snacc_quests_seasons.sql` | daily quests, XP and level, weekly seasons, season leaderboard, hall of fame, two quest badges (UI-153, UI-154) |
 | `migrations/20261113000007_snacc_referrals.sql` | `referrals_snacc`, `snacc_claim_referral()`, `referral_counts_snacc`, the `recruiter` badge and a `referrals` key in the data export (UI-158) |
+| `migrations/20261113000008_snacc_push.sql` | Web Push (UI-160): `push_subscriptions_snacc`, the service-only `push_vapid_snacc`, `notifications_snacc.pushed_at`, cron job `snacc_push_dispatch` (every minute) |
+| `tests/snacc_push.sql` | Web Push RLS/privilege/constraint assertions, rolled back |
 | `tests/snacc_rls.sql` | RLS/privilege assertions in one rolled-back transaction |
 | `tests/snacc_referrals.sql` | referral claim rules, the `recruiter` badge, RLS visibility of `referrals_snacc` and the export key (rolled back) |
 | `tests/snacc_quests_seasons.sql` | quest/XP/level/season math on sample rows, plus privileges and row-level security of the new views (rolled back) |
 | `functions/_shared/*.ts` | pure TypeScript (Web Crypto + fetch only, no `node:` imports, no Deno globals); compiled and unit-tested by the repo's `npm test` |
 | `functions/_deno/db.ts` | Deno-only glue (`Deno.env`, `npm:@supabase/supabase-js@2`) |
-| `functions/<name>/index.ts` | `Deno.serve` entry points: `near-auth`, `record-tx`, `notify-scan`, `starter-pack` |
+| `functions/<name>/index.ts` | `Deno.serve` entry points: `near-auth`, `record-tx`, `notify-scan`, `starter-pack`, `track`, `push`, `push-dispatch` |
 | `config.toml` | `verify_jwt` per function (CLI deploys) |
 
 Contract: `snacc-v001.testnet` (override with `SNACC_CONTRACT_ID`). RPC: `https://test.rpc.fastnear.com`,
@@ -73,6 +75,8 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `admins_snacc` | `user_id` pk → profiles_snacc, `added_at` | – | – | service / SQL editor |
 | `blocked_terms_snacc` | `term` pk (`^[a-z]{3,30}$`), `kind` reserved/abusive | – | – | admins via `snacc_admin_block_term()` |
 | `announcements_snacc` | `id`, `title`, `body`, `created_by`, `created_at`, `expires_at` | select (unexpired) | select (unexpired) | admins via `snacc_admin_broadcast()` |
+| `push_subscriptions_snacc` (UI-160) | `id`, `user_id` → auth.users (cascade), `endpoint` unique (https), `p256dh`, `auth`, `user_agent`, `created_at`, `last_ok_at`, `failures` | – | select, insert (identifying columns only), delete, own rows | service (`push`, `push-dispatch`) |
+| `push_vapid_snacc` (UI-160) | single row: `public_key`, `private_jwk`, `created_at` | – | – (no policy, no grant) | service only (`push`, `push-dispatch`) |
 | `client_telemetry_snacc` | `kind` event/error, `name`, `device_id`, `session_id`, `route`, `props`, `message`, `stack`, `ip_hash`, `client_at` | – | – | service (track); admins read aggregates via `snacc_admin_metrics()` |
 
 Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned by unit tests):
@@ -279,6 +283,63 @@ emails, URL queries, NEAR account ids and hashes; no account id, no raw IP. Admi
 `snacc_admin_metrics(days)`: daily funnel (landing → app → onboarding → wallet → sign-in → first successful tx,
 distinct devices), D1/D7 retention by first-seen day, and the top client errors of the last 7 days.
 
+### Web Push: `push` (verify_jwt **true**) and `push-dispatch` (verify_jwt **false**, UI-160)
+
+Notifications reach a player who closed the tab through the Web Push protocol (RFC 8030), with RFC 8291 message
+encryption (`aes128gcm`) and RFC 8292 VAPID authentication. Everything is Web Crypto in `_shared/webpush.ts`; no
+dependency was added. The frontend registers `public/sw.js` only when a player turns push on.
+
+**`push`** (one function, three routes, always a Supabase JWT: the player's access token for subscribe/unsubscribe,
+and any valid project JWT for the key route; split from `push-dispatch` because that one is cron-only):
+
+- `GET` or `POST /push/key` → 200 `{ "publicKey": "<base64url, 65 bytes>" }`: the VAPID public key the browser passes as
+  `applicationServerKey`. Generates the key pair on first use (see below).
+- `POST /push/subscribe` `{ "endpoint", "keys": { "p256dh", "auth" } }` (a browser `PushSubscription.toJSON()`) →
+  201 `{ "subscribed": true }`. 400 `invalid_endpoint` (must be `https://` on a known push service: `fcm.googleapis.com`,
+  `web.push.apple.com`, `updates.push.services.mozilla.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`,
+  `*.push.apple.com`; no userinfo, port, fragment, IP literal or redirect tricks) or `invalid_keys` (`p256dh` must be a
+  P-256 point on the curve, `auth` 16 bytes), 401 `unauthorized`, 409 `too_many_subscriptions` (max 10 devices per
+  player), 413 `too_large` (body over 4 KB). Idempotent per endpoint; the same browser signed in as another player moves
+  the row to that player. The `User-Agent` header is stored truncated to 120 characters.
+- `POST /push/unsubscribe` `{ "endpoint" }` → 200 `{ "unsubscribed": true, "removed": 0|1 }`; removes only the caller's own row.
+
+**`push-dispatch`** (cron `snacc_push_dispatch`, every minute, header `x-cron-secret` = the same Vault secret as
+`notify-scan`) → 200 `{ chunks, claimed, sent, gone, failed, removed, noSubscription, stale, deferred }` (also one JSON
+log line, with failures grouped by HTTP status and never an endpoint). It reads `notifications_snacc` rows with
+`pushed_at IS NULL`, oldest first, in chunks of 50, and sends one push per device of that player.
+
+Why a separate cron function instead of sending inside `notify-scan`: `notify-scan` is bounded by its 50 s scan budget
+and RPC reads, and only produces `starving`/`distressed`/`lost`. The same inbox also receives the starter pack, dividends
+and admin broadcasts (`snacc_admin_broadcast()` inserts straight from SQL). One `pushed_at` marker covers every producer,
+a slow push service never delays scanning, and a push outage never blocks notifications. Cost: up to one minute of delay
+and an extra empty-run invocation per minute.
+
+- **Claim before send**: rows are stamped (`pushed_at = now()` where it is still null) before any request goes out, so
+  overlapping runs cannot double-send. Delivery is at-most-once and best effort; the in-app inbox (Realtime) stays the
+  source of truth.
+- **Nothing historic**: the migration stamps every existing row; rows older than 30 minutes are stamped without a send.
+- **Caps**: chunks of 50 notifications, at most 200 sends per chunk, 8 requests in flight, 40 s wall-clock budget, 8 s per
+  request. What does not fit stays unpushed and goes in the next run (a broadcast to many players drains over a few minutes).
+- **Respects `notification_prefs_snacc`**: a disabled kind never becomes a notification row, hence is never pushed.
+- **Payload** `{ "title", "body", "url", "tag" }`, at most about 1.4 KB: `url` is `/app?feed=<strain_id>` for `starving` and
+  `distressed` (UI-159 feed window), `/app` otherwise; `tag` = `snacc-<notification id>`, the same tag the in-page browser alert
+  uses, so a device with both shows one notification. Push TTL 6 hours, `Urgency: normal`.
+- **Failures**: `404`/`410` from the push service deletes the subscription; anything else (429, 5xx, timeout, 403) adds one to
+  `failures` for that run (one delivery in the run resets it to 0 and sets `last_ok_at`); 10 failed runs in a row delete it.
+- **SSRF guard**: the endpoint allow-list is re-checked before every send (and the table constraint pins `https://`), so a row
+  inserted straight into the table (the RLS insert policy exists) can never make the backend call another host; redirects are never followed.
+
+**VAPID key: generated in the backend, never pasted.** On first use (`GET /push/key` or the first dispatch with something to
+send) `getOrCreateVapid()` generates a P-256 key pair with Web Crypto and stores `{ public_key, private_jwk }` in the single-row
+table `push_vapid_snacc` with `insert … on conflict do nothing`, then re-reads; if two functions race on the very first call,
+one insert wins and both use that key. The table has RLS on, no policy, and all privileges revoked from `anon` and
+`authenticated`: only the service role (the Edge Functions) can read it, and no endpoint ever returns the private key. The
+private key never exists in a chat, a repository file, an env var or a log; it is as protected as the service-role key
+(anyone with database admin access can read it). The VAPID subject defaults to `https://snacc-nu.vercel.app` (override with
+`SNACC_VAPID_SUBJECT`, a `mailto:` or `https:` URI). **Do not delete the row casually**: every existing subscription was created
+for the old public key and would fail until the player turns push off and on again (the frontend re-subscribes automatically
+when it notices a key change).
+
 ## Environment and secrets
 
 Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions use the service role).
@@ -293,6 +354,7 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 | `SNACC_CONTRACT_ID` (optional) | record-tx, notify-scan | default `snacc-v001.testnet` |
 | `SNACC_AUTH_EMAIL_DOMAIN` (optional) | near-auth | default `snacc-nu.vercel.app` |
 | `SNACC_SCAN_MAX_PROFILES` (optional) | notify-scan | default 50 |
+| `SNACC_VAPID_SUBJECT` (optional) | push-dispatch | VAPID `sub` claim, `mailto:` or `https:`; default `https://snacc-nu.vercel.app`. No VAPID secret exists: the key pair is generated and stored by the backend |
 
 ## Apply and deploy (in this order)
 
@@ -322,6 +384,12 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
    `…0009` so the export keeps its `referrals` key. Then run `tests/snacc_referrals.sql` (expect
    `ALL SNACC REFERRAL CHECKS PASSED`).
 
+9. Web Push (UI-160): deploy `push` (verify_jwt **true**) and `push-dispatch` (verify_jwt **false**) with `_shared/` and
+   `_deno/` **first**, then apply `migrations/20261113000008_snacc_push.sql` (it schedules `snacc_push_dispatch` every minute,
+   reusing the Vault secret from step 7), then run `tests/snacc_push.sql` (expect `ALL SNACC PUSH CHECKS PASSED`).
+   Smoke test: `POST /push/key` with the anon key as bearer returns `{ "publicKey": "B…" }` (87 characters); the second call
+   returns the same key; `POST /push-dispatch` without the header returns 401.
+
 ## Tests
 
 `npm test` compiles `functions/_shared/**` with the backend's `tsc` (`rewriteRelativeImportExtensions` turns the
@@ -335,5 +403,10 @@ Deno-style `.ts` imports into `.js`) and runs:
 - `test/supabase-rules.test.ts`: achievements/streaks, notify-scan planning, starter-pack handler, signer vector;
 - `test/supabase-quests.test.ts`: XP table and daily cap, level curve, quest progress, season boundaries, and a check
   that `_shared/xp.ts` matches the migration text (XP table, cap, epoch, quest catalog).
+
+- `test/supabase-push.test.ts` (UI-160): RFC 8291 Appendix A message reproduced byte for byte, a round trip through an
+  independent receiver, RFC 8292 example JWT verified plus our own ES256 JWT (header/claim layout, expiry, wrong key), the
+  VAPID key lifecycle and race, the push sender against a fake `fetch`, endpoint allow-list, subscribe/unsubscribe handlers,
+  payload building and dispatch planning (claims, caps, stale rows, failure accounting).
 
 The `index.ts` entry points and the SQL are not executed by `npm test`.
