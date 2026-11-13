@@ -36,6 +36,8 @@ pg_cron (every 10 min) ─► POST /chain-index (x-cron-secret) ─► NearBlock
 | `migrations/20261113000007_snacc_referrals.sql` | `referrals_snacc`, `snacc_claim_referral()`, `referral_counts_snacc`, the `recruiter` badge and a `referrals` key in the data export (UI-158) |
 | `migrations/20261113000008_snacc_push.sql` | Web Push (UI-160): `push_subscriptions_snacc`, the service-only `push_vapid_snacc`, `notifications_snacc.pushed_at`, cron job `snacc_push_dispatch` (every minute) |
 | `tests/snacc_push.sql` | Web Push RLS/privilege/constraint assertions, rolled back |
+| `migrations/20261113000013_snacc_view_grants.sql` | view privilege hygiene (SEC-120): `quest_catalog_snacc` becomes `security_invoker`, write grants on read views revoked from `anon`/`authenticated` |
+| `tests/snacc_view_grants.sql` | read-only assertions: every Snacc view is `security_invoker` except the deliberate `referral_counts_snacc`, and no view grants a write privilege |
 | `tests/snacc_rls.sql` | RLS/privilege assertions in one rolled-back transaction |
 | `tests/snacc_referrals.sql` | referral claim rules, the `recruiter` badge, RLS visibility of `referrals_snacc` and the export key (rolled back) |
 | `tests/snacc_quests_seasons.sql` | quest/XP/level/season math on sample rows, plus privileges and row-level security of the new views (rolled back) |
@@ -465,11 +467,15 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
    Smoke test: `POST /chain-index` without the header returns 401; with the header it returns the counts JSON. The first runs
    backfill the history 50 txs at a time (see `more`); the views fill as it goes.
 
-9. Web Push (UI-160): deploy `push` (verify_jwt **true**) and `push-dispatch` (verify_jwt **false**) with `_shared/` and
+10. Web Push (UI-160): deploy `push` (verify_jwt **true**) and `push-dispatch` (verify_jwt **false**) with `_shared/` and
    `_deno/` **first**, then apply `migrations/20261113000008_snacc_push.sql` (it schedules `snacc_push_dispatch` every minute,
    reusing the Vault secret from step 7), then run `tests/snacc_push.sql` (expect `ALL SNACC PUSH CHECKS PASSED`).
    Smoke test: `POST /push/key` with the anon key as bearer returns `{ "publicKey": "B…" }` (87 characters); the second call
    returns the same key; `POST /push-dispatch` without the header returns 401.
+11. View grants (SEC-120), last, after every file that creates a view (`…0001`, `…0004`, `…0006`, `…0007`): apply
+   `migrations/20261113000013_snacc_view_grants.sql`, then run `tests/snacc_view_grants.sql` (read-only; expect
+   `ALL SNACC VIEW GRANT CHECKS PASSED`). Re-apply it after any later migration that creates a new view (or drops and
+   recreates one): the Supabase default privileges grant write privileges on every new view.
 
 ## Tests
 
