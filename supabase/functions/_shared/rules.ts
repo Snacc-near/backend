@@ -41,6 +41,9 @@ export const ACHIEVEMENT_CODES = [
   "rescuer",
   "gifter",
   "colony_5",
+  // Awarded to a referrer by the SQL trigger (migration 0007) when a referee's first `incubate_strain` is recorded.
+  // It depends on `referrals_snacc`, not on the player's own activity, so `computeAchievements` never returns it.
+  "recruiter",
 ] as const;
 export type AchievementCode = (typeof ACHIEVEMENT_CODES)[number];
 

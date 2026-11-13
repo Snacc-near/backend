@@ -28,7 +28,9 @@ pg_cron (every 10 min) ─► POST /notify-scan (x-cron-secret) ─► nft_token
 | `migrations/20261113000001_snacc_core.sql` | tables, RLS, grants, achievements trigger, views, realtime |
 | `migrations/20261113000002_snacc_cron.sql` | inert (`select 1`); the `pg_cron` schedule is in comments, enable by hand |
 | `migrations/20261113000004_snacc_quests_seasons.sql` | daily quests, XP and level, weekly seasons, season leaderboard, hall of fame, two quest badges (UI-153, UI-154) |
+| `migrations/20261113000007_snacc_referrals.sql` | `referrals_snacc`, `snacc_claim_referral()`, `referral_counts_snacc`, the `recruiter` badge and a `referrals` key in the data export (UI-158) |
 | `tests/snacc_rls.sql` | RLS/privilege assertions in one rolled-back transaction |
+| `tests/snacc_referrals.sql` | referral claim rules, the `recruiter` badge, RLS visibility of `referrals_snacc` and the export key (rolled back) |
 | `tests/snacc_quests_seasons.sql` | quest/XP/level/season math on sample rows, plus privileges and row-level security of the new views (rolled back) |
 | `functions/_shared/*.ts` | pure TypeScript (Web Crypto + fetch only, no `node:` imports, no Deno globals); compiled and unit-tested by the repo's `npm test` |
 | `functions/_deno/db.ts` | Deno-only glue (`Deno.env`, `npm:@supabase/supabase-js@2`) |
@@ -63,6 +65,8 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `hall_of_fame_snacc` (view, `security_invoker`) | top 3 (`rank` 1..3) of every finished season | select | select | – |
 | `snacc_my_quests()` (function, `security invoker`) | today's three quests of `auth.uid()` with `progress`, `completed`, `resets_at` | – | execute | – |
 | `follows_snacc` | pk (`follower`, `followee`) → profiles_snacc, no self-follow | select | select; insert/delete as `follower = auth.uid()` | user |
+| `referrals_snacc` (UI-158) | `referee` pk → profiles_snacc, `referrer` → profiles_snacc, `created_at`; `referee <> referrer` | – | select rows where `auth.uid()` is the referrer or the referee | only `snacc_claim_referral()` (security definer) |
+| `referral_counts_snacc` (view, owner rights) | `user_id` (referrer), `near_account_id`, `recruits`, `recruits_hatched`; aggregate only, never lists the referees | select | select | – |
 | `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
 | `scan_queue_snacc` (view, `security_invoker`) | profiles left-joined with scan state | – | – | read by notify-scan |
@@ -70,7 +74,9 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned by unit tests):
 `first_hatch` (≥ 1 `incubate_strain`), `first_feed` (≥ 1 `feed_strain`), `feeds_10` (≥ 10 `feed_strain`),
 `streak_3` / `streak_7` (best run of consecutive UTC days with ≥ 1 `feed_strain`), `rescuer` (≥ 1 `adopt`),
-`gifter` (≥ 1 `nft_transfer`), `colony_5` (≥ 5 `incubate_strain` + `divide_strain`).
+`gifter` (≥ 1 `nft_transfer`), `colony_5` (≥ 5 `incubate_strain` + `divide_strain`). Migration `0007` adds
+`recruiter`: awarded to the referrer when a referee's first recorded `incubate_strain` arrives (cosmetic, see
+`snacc_claim_referral()` under "Player RPCs"); it is listed in `rules.ts` but only the SQL trigger awards it.
 `streaks_snacc.current_streak_days` is the run ending on the last feed day, counted only if that day is
 today or yesterday (UTC), else 0.
 
@@ -113,7 +119,12 @@ Player RPCs (`authenticated` only, pinned to `auth.uid()`):
   with a Snacc profile.
 - `snacc_export_my_data()` (UI-163): one JSON document `snacc-export-v1` with the caller's profile, activity,
   achievements, notifications, notification prefs, the players they follow (public account id + username), a
-  follower count, and their starter claim (without `ip_hash`).
+  follower count, their starter claim (without `ip_hash`) and, since `0007`, a `referrals` key
+  (`referred_by` and `recruits`, with only the account id and username of the other player).
+- `snacc_claim_referral(p_referrer_account text)` (UI-158): attaches a referrer to the caller once. It returns a
+  status text instead of raising: `claimed`, `no_profile`, `already_referred`, `invalid_account`,
+  `unknown_referrer`, `self_referral` or `not_new_player` (the caller already has a recorded `incubate_strain`).
+  Not signed in raises `28000`. The `recruiter` badge is cosmetic: no XP, no token, no money value (testnet).
 
 ## HTTP contracts
 
@@ -276,8 +287,11 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 7. Enable the schedule: apply `migrations/20261113000005_snacc_cron_vault.sql` (pg_cron + pg_net, a
    database-generated Vault secret, `snacc_cron_secret_ok()`, and `cron.schedule('snacc_notify_scan',
    '*/10 * * * *', ...)`). The commented steps in `20261113000002_snacc_cron.sql` are superseded.
-8. Apply the later migrations in file order (`…0003` delete account, `…0009` data export, `…0010` starter-pack
-   `ip_hash`, and any newer file); each is idempotent and only touches `*_snacc` / `snacc_*` objects.
+8. Apply the later migrations in file order (`…0003` delete account, `…0007` referrals, `…0009` data export,
+   `…0010` starter-pack `ip_hash`, and any newer file); each is idempotent and only touches `*_snacc` / `snacc_*`
+   objects. `…0007` and `…0009` both define `snacc_export_my_data()`: on a fresh replay apply `…0007` again after
+   `…0009` so the export keeps its `referrals` key. Then run `tests/snacc_referrals.sql` (expect
+   `ALL SNACC REFERRAL CHECKS PASSED`).
 
 ## Tests
 
