@@ -2,8 +2,9 @@
 --
 -- Why: the contract stores no parent ids. Divide / splice / hostile takeover / adopt / harvest / feed facts exist only as
 -- NEP-297 `EVENT_JSON:` logs in transaction receipts. record-tx only sees txs our own UI users submit, so the new
--- `chain-index` Edge Function lists every tx to the contract (NearBlocks API v3), fetches each outcome with
--- EXPERIMENTAL_tx_status and stores the events of successful receipts here.
+-- `chain-index` Edge Function lists every tx to the contract and to the market contract snacc-market.testnet (NearBlocks API v3),
+-- fetches each outcome with EXPERIMENTAL_tx_status and stores the events of successful receipts here: the Snacc contract's own
+-- events (standards 'snacc', 'nep171', 'nep141') and the market's 'snacc_market' events (listed, sold, delisted, price_updated).
 --
 -- Objects (all `_snacc` / `snacc_`; nothing else in the shared project is touched):
 --   chain_events_snacc          one row per EVENT_JSON log (public read, service write), unique (receipt_id, log_index)
@@ -239,7 +240,7 @@ grant select on public.chain_events_current_snacc, public.strain_lineage_snacc, 
   to anon, authenticated, service_role;
 
 comment on view public.strain_lineage_snacc is 'UI-155: divided / spliced_into / hostile links between strains of the current state generation. For spliced_into and hostile, child_id is the absorbed strain and parent_id the survivor.';
-comment on view public.strain_history_snacc is 'UI-155: per-strain event history from the chain index (current state generation).';
+comment on view public.strain_history_snacc is 'UI-155: per-strain event history from the chain index (current state generation), including market listed / sold / delisted / price_updated.';
 comment on view public.graveyard_snacc is 'UI-156: strains that died (harvested, spliced away, hostile takeover) with the account that did it.';
 
 -- ---------------------------------------------------------------------------------------------

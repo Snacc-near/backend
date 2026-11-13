@@ -2,8 +2,9 @@
  * Contract-wide chain index (UI-155, UI-156).
  *
  * The Snacc contract stores no parent ids: divide / splice / hostile takeover / adopt / harvest / feed facts exist only as
- * NEP-297 `EVENT_JSON:` logs in transaction receipts. `chain-index` lists the transactions to the contract (NearBlocks API v3),
- * fetches each outcome with `EXPERIMENTAL_tx_status`, and stores every event of a successful receipt in `chain_events_snacc`.
+ * NEP-297 `EVENT_JSON:` logs in transaction receipts. `chain-index` lists the transactions to the contract and to the market
+ * contract (NearBlocks API v3), fetches each outcome with `EXPERIMENTAL_tx_status`, and stores every event of a successful
+ * receipt (the Snacc contract's events and the market's `snacc_market` events) in `chain_events_snacc`.
  *
  * Everything here is pure TypeScript (fetch / BigInt only) so it runs in Deno and in Node tests. The Edge Function entry point
  * (`chain-index/index.ts`) only wires the I/O: NearBlocks, the NEAR RPC and Supabase.

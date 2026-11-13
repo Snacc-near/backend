@@ -19,6 +19,9 @@ browser (snacc-nu.vercel.app)
   │
 pg_cron (every 10 min) ─► POST /notify-scan (x-cron-secret) ─► nft_tokens_for_owner + get_strain
                                                             └─► notifications_snacc, scan_state_snacc
+pg_cron (every 10 min) ─► POST /chain-index (x-cron-secret) ─► NearBlocks v3 txns ─► EXPERIMENTAL_tx_status
+                                                            └─► chain_events_snacc, chain_index_state_snacc
+                              views: strain_lineage_snacc, strain_history_snacc, graveyard_snacc  (public, read-only)
 ```
 
 ## Layout
@@ -28,11 +31,13 @@ pg_cron (every 10 min) ─► POST /notify-scan (x-cron-secret) ─► nft_token
 | `migrations/20261113000001_snacc_core.sql` | tables, RLS, grants, achievements trigger, views, realtime |
 | `migrations/20261113000002_snacc_cron.sql` | inert (`select 1`); the `pg_cron` schedule is in comments, enable by hand |
 | `migrations/20261113000004_snacc_quests_seasons.sql` | daily quests, XP and level, weekly seasons, season leaderboard, hall of fame, two quest badges (UI-153, UI-154) |
+| `migrations/20261113000006_snacc_chain_index.sql` | contract-wide chain index: `chain_events_snacc`, `chain_index_state_snacc`, lineage / history / graveyard views, `snacc_chain_index` cron job (UI-155, UI-156) |
+| `tests/snacc_chain_index.sql` | view math, current-generation filter, privileges of the chain index on fixture events (rolled back) |
 | `tests/snacc_rls.sql` | RLS/privilege assertions in one rolled-back transaction |
 | `tests/snacc_quests_seasons.sql` | quest/XP/level/season math on sample rows, plus privileges and row-level security of the new views (rolled back) |
 | `functions/_shared/*.ts` | pure TypeScript (Web Crypto + fetch only, no `node:` imports, no Deno globals); compiled and unit-tested by the repo's `npm test` |
 | `functions/_deno/db.ts` | Deno-only glue (`Deno.env`, `npm:@supabase/supabase-js@2`) |
-| `functions/<name>/index.ts` | `Deno.serve` entry points: `near-auth`, `record-tx`, `notify-scan`, `starter-pack` |
+| `functions/<name>/index.ts` | `Deno.serve` entry points: `near-auth`, `record-tx`, `notify-scan`, `starter-pack`, `chain-index` (and `track`) |
 | `config.toml` | `verify_jwt` per function (CLI deploys) |
 
 Contract: `snacc-v001.testnet` (override with `SNACC_CONTRACT_ID`). RPC: `https://test.rpc.fastnear.com`,
@@ -66,6 +71,12 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
 | `scan_queue_snacc` (view, `security_invoker`) | profiles left-joined with scan state | – | – | read by notify-scan |
+| `chain_events_snacc` | pk (`receipt_id`, `log_index`), `tx_hash`, `standard`, `version`, `event`, `data` jsonb, `signer_id`, `block_height`, `block_time`; one row per NEP-297 `EVENT_JSON` log of a successful receipt (16+ digit integers are JSON strings) | select | select | service (chain-index) |
+| `chain_index_state_snacc` | `account_id` pk (one cursor row per indexed account), `head_ts`, `seen`, `walk`, `retry`, `dead`, `last_counts`, `last_run_at` | – | – | service (chain-index) |
+| `chain_events_current_snacc` (view, `security_invoker`) | `chain_events_snacc` from the latest `migrate` / `new` (state reset) onwards, without the pseudo events | select | select | – |
+| `strain_lineage_snacc` (view, `security_invoker`) | `child_id`, `parent_id`, `relation` ∈ divided / spliced_into / hostile, `generation` (divided only), `actor`, `tx_hash`, `block_height`, `block_time`. For `spliced_into` / `hostile`, `child_id` is the absorbed strain and `parent_id` the survivor | select | select | – |
+| `strain_history_snacc` (view, `security_invoker`) | `strain_id`, `event`, `role`, `actor`, `amount` (headline figure, numeric), `data`, `tx_hash`, `block_height`, `block_time` | select | select | – |
+| `graveyard_snacc` (view, `security_invoker`) | `strain_id`, `cause` ∈ harvested_starving / spliced_burned / hostile_takeover, `by_account`, `absorbed_into`, `owner_before`, `amount`, `tx_hash`, `block_height`, `block_time` | select | select | – |
 | `admins_snacc` | `user_id` pk → profiles_snacc, `added_at` | – | – | service / SQL editor |
 | `blocked_terms_snacc` | `term` pk (`^[a-z]{3,30}$`), `kind` reserved/abusive | – | – | admins via `snacc_admin_block_term()` |
 | `announcements_snacc` | `id`, `title`, `body`, `created_by`, `created_at`, `expires_at` | select (unexpired) | select (unexpired) | admins via `snacc_admin_broadcast()` |
@@ -234,6 +245,65 @@ all on):
 `dedupe_key` = `<kind>:<strain_id>:<UTC day>`, inserted with `on conflict do nothing`, so each condition
 notifies at most once per strain per UTC day. `scan_state_snacc` keeps strain id → last status.
 
+### `chain-index` (verify_jwt **false**, header `x-cron-secret` = Vault secret `snacc_cron_secret`, UI-155 / UI-156)
+
+`POST /chain-index` → 200 `{ "pages", "listed", "fetched", "resets", "events", "malformed", "skipped", "duplicates",
+"errors", "retried", "dead", "more", "retryQueue", "deadTotal", "accounts": { "<account>": { ...same counts } } }` (also logged as
+one JSON line). 401 `unauthorized` / 503 `not_configured` exactly as for `notify-scan` (same Vault check; the optional
+`SNACC_CRON_SECRET` edge secret wins when set). 503 `index_unavailable` when the NearBlocks listing of an account cannot be
+read (HTTP error, 429, bad body); that account's cursor is left untouched and the next scheduled run tries again.
+
+Why it exists: the contract stores no parent ids. Divide, splice, hostile takeover, adopt, harvest and feed facts exist
+only as NEP-297 `EVENT_JSON:` logs in transaction receipts, and `record-tx` only sees txs our own UI users submit.
+
+What a run does, per indexed account (the Snacc contract, then `snacc-market.testnet`):
+
+1. Lists txs with NearBlocks API **v3** (`GET /v3/accounts/<account>/txns?limit=100[&next=<cursor>]`; v1/v2 are switched
+   off on 2026-11-22 and v1 already refuses `order=asc`, v3 only walks newest to oldest). Optional `NEARBLOCKS_API_KEY` is
+   sent as `Authorization: Bearer`. At most `SNACC_INDEX_MAX_PAGES` (default 3) pages per run; once caught up a run is one
+   request.
+2. Skips txs NearBlocks reports as failed, txs to another receiver, and txs without a FunctionCall. A successful `migrate` or
+   `new` of the **Snacc contract** is stored without any RPC call as the pseudo event `snacc-index / state_reset` (see below).
+3. For every other tx: `EXPERIMENTAL_tx_status` through `_shared/near-rpc.ts` (FastNEAR regular nodes first; the archival node
+   `https://archival-rpc.testnet.fastnear.com` first for txs older than 36 h, because regular nodes need ~10 s to answer
+   `TIMEOUT_ERROR / NOT_OBSERVED` for them). Every `EVENT_JSON:` log of a **successful** receipt is upserted into
+   `chain_events_snacc` (`on conflict (receipt_id, log_index) do nothing`): anything the Snacc contract logged, plus the
+   `snacc_market` events of the market contract (`listed`, `sold`, `delisted`, `price_updated`). A market `buy` / `delist` tx also
+   carries the Snacc contract's `nep171 nft_transfer`. `signer_id` is the tx signer, `block_height` / `block_time` are those of the
+   including block (from the listing).
+4. Stops after `SNACC_INDEX_MAX_TXS` fetched txs per account (default 50, max 500) or ~50 s, and stores where to resume.
+
+Cursor (`chain_index_state_snacc`, one row per account): `head_ts` is the block timestamp (ns, text) up to which everything has been
+handled; it only advances when a walk reaches the old head or the end of the listing, so a budget stop never leaves a gap. A walk
+that is cut short keeps `walk` (`cursor`, `resumeTs`). A 5-minute lookback below `head_ts` re-lists txs NearBlocks may have indexed
+late (`seen` remembers the ones already handled). A tx whose RPC fetch or database write fails goes to `retry` (retried first on
+later runs) and after 5 attempts to `dead` (kept for audit). Inspect with
+`select account_id, last_run_at, head_ts, walk is not null as walking, jsonb_array_length(retry) as retry, jsonb_array_length(dead) as dead, last_counts from chain_index_state_snacc;`.
+A backlog (first run: the whole history, 660+ txs) is worked off 50 txs per run; call the function repeatedly (the `more` flag says
+whether to continue) or raise `SNACC_INDEX_MAX_TXS` for a manual catch-up.
+
+State generations: `migrate()` wipes the strain state and restarts strain ids at 1 (`new()` is the first init), so an id is only
+meaningful inside one generation. The views therefore show only the **current generation**: events from the latest `state_reset`
+onwards (`chain_events_current_snacc`). Older generations stay in `chain_events_snacc`.
+
+View contracts (all read-only for `anon` / `authenticated`; chain data is public):
+
+- `strain_lineage_snacc`: `strain_divided` → `divided` (child_id = the new strain, `generation` = its generation);
+  `strains_spliced` → `spliced_into` (child_id = `absorbed_id`, parent_id = `dominant_id`);
+  `hostile_takeover_spliced` → `hostile` (child_id = `target_id`, parent_id = `raider_id`).
+- `strain_history_snacc`: per strain, the events `strain_created`, `fed`, `extracted`, `transmuted`, `synthesized`,
+  `genome_committed`, `genome_mutated`, `atp_allocated`, `aether_burned_for_dividend`, `dividend_claimed`, `npc_spores_bought`,
+  `strain_divided` (roles parent / child), `strains_spliced` (dominant / absorbed), `hostile_takeover_spliced` (raider / target),
+  `strain_adopted` (target / payer), `strain_liquidated` (target), `trait_conjugated` (source / target), `nep171 nft_transfer`
+  (one row per token id, actor = the sender) and the market events `listed`, `sold`, `delisted`, `price_updated`.
+  Not listed (not per-strain facts): `atp_spent`, `dividend_inflow`, `zone_changed`, `feast_result`, `epoch_dividend_closed`,
+  `nutrient_burst_released`, the `nep141 ft_*` events, `signer_added` / `signer_removed`.
+- `graveyard_snacc`: `strain_liquidated` → `harvested_starving` (by_account = the harvester), `strains_spliced` → `spliced_burned`
+  (by_account = the caller, absorbed_into = the dominant strain), `hostile_takeover_spliced` → `hostile_takeover`
+  (by_account = the raider's owner, absorbed_into = the raider strain). `owner_before` comes from the latest earlier
+  `strain_created` / `strain_divided` / `strain_adopted` / `nft_transfer` of that strain and is `null` when none is indexed (a
+  strain escrowed in the market shows `snacc-market.testnet`).
+
 ### `starter-pack` (verify_jwt **true**)
 
 `POST /starter-pack` with `Authorization: Bearer <session access token>` (no body)
@@ -282,6 +352,10 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 | `SNACC_CONTRACT_ID` (optional) | record-tx, notify-scan | default `snacc-v001.testnet` |
 | `SNACC_AUTH_EMAIL_DOMAIN` (optional) | near-auth | default `snacc-nu.vercel.app` |
 | `SNACC_SCAN_MAX_PROFILES` (optional) | notify-scan | default 50 |
+| `SNACC_INDEX_MAX_TXS` (optional) | chain-index | txs fetched per account per run, default 50, max 500 |
+| `SNACC_INDEX_MAX_PAGES` (optional) | chain-index | NearBlocks pages per account per run, default 3, max 20 |
+| `SNACC_MARKET_CONTRACT_ID` (optional) | chain-index | default `snacc-market.testnet`; `none` turns market indexing off |
+| `NEARBLOCKS_API_KEY` (optional) | chain-index | sent as `Authorization: Bearer` when set; the free tier works without |
 
 ## Apply and deploy (in this order)
 
@@ -307,6 +381,13 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
    '*/10 * * * *', ...)`). The commented steps in `20261113000002_snacc_cron.sql` are superseded.
 8. Apply the later migrations in file order (`…0003` delete account, `…0009` data export, `…0010` starter-pack
    `ip_hash`, and any newer file); each is idempotent and only touches `*_snacc` / `snacc_*` objects.
+9. Chain index (UI-155, UI-156), after `…0005` (it reuses the Vault secret): apply
+   `migrations/20261113000006_snacc_chain_index.sql` (tables, views, and `cron.schedule('snacc_chain_index', '*/10 * * * *', ...)`),
+   run `tests/snacc_chain_index.sql` (expect the notice `ALL SNACC CHAIN INDEX CHECKS PASSED`; it rolls back), then deploy the
+   function **before or right after** the migration, with `_shared/` and `_deno/` and **verify_jwt false**:
+   `supabase functions deploy chain-index --project-ref vldhsabgpfxccsljdtye --no-verify-jwt` (or via `config.toml`).
+   Smoke test: `POST /chain-index` without the header returns 401; with the header it returns the counts JSON. The first runs
+   backfill the history 50 txs at a time (see `more`); the views fill as it goes.
 
 ## Tests
 
@@ -320,6 +401,11 @@ Deno-style `.ts` imports into `.js`) and runs:
 - `test/supabase-auth.test.ts`: challenge/verify contract, nonce lifecycle, function-call key rejection, CORS;
 - `test/supabase-rules.test.ts`: achievements/streaks, notify-scan planning, starter-pack handler, signer vector;
 - `test/supabase-quests.test.ts`: XP table and daily cap, level curve, quest progress, season boundaries, and a check
-  that `_shared/xp.ts` matches the migration text (XP table, cap, epoch, quest catalog).
+  that `_shared/xp.ts` matches the migration text (XP table, cap, epoch, quest catalog);
+- `test/supabase-chain-index.test.ts`: `EVENT_JSON` parsing (exact u128 amounts), event extraction on 26 real
+  `snacc-v001.testnet` / `snacc-market.testnet` tx fixtures (divide, splice, hostile takeover, adopt, harvest, feed, transfers,
+  market list/buy/delist, ...), the NearBlocks v3 page parser on two real pages, which node is asked first, and the cursor /
+  batching loop (tx cap, page cap, resume, lookback, retry and dead entries, NearBlocks failure leaves the state untouched).
 
-The `index.ts` entry points and the SQL are not executed by `npm test`.
+The `index.ts` entry points and the SQL are not executed by `npm test`. `tests/snacc_chain_index.sql` was also run on an in-memory
+Postgres (PGlite) with the roles `anon` / `authenticated` / `service_role` stubbed, without the pg_cron / Vault part.
