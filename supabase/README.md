@@ -145,11 +145,13 @@ with the inclusion block's timestamp. Idempotent on `tx_hash`: a repeat returns 
 `achievements` lists codes newly earned by this call. Other errors: 400 `invalid_tx_hash`, 401 `unauthorized`,
 403 `no_profile`, 404 `tx_not_found`, 503 `rpc_unavailable`.
 
-### `notify-scan` (verify_jwt **false**, header `x-cron-secret` = `SNACC_CRON_SECRET`)
+### `notify-scan` (verify_jwt **false**, header `x-cron-secret` = Vault secret `snacc_cron_secret`)
 
 `POST /notify-scan` → 200 `{ "profiles", "strains", "planned", "inserted", "errors", "skipped" }` (counts,
-also logged as one JSON line). 401 `unauthorized` on a wrong/missing secret, 503 `not_configured` without
-`SNACC_CRON_SECRET`.
+also logged as one JSON line). 401 `unauthorized` on a wrong/missing secret, 503 `not_configured` when the Vault check
+`snacc_cron_secret_ok()` is missing. The secret is generated inside the database by
+`migrations/20261113000005_snacc_cron_vault.sql` and never copied by hand; the optional `SNACC_CRON_SECRET`
+edge secret, when set, takes precedence (older setups keep working).
 
 Takes up to `SNACC_SCAN_MAX_PROFILES` (default 50, max 500) profiles from `scan_queue_snacc`, least recently
 scanned first, and stops starting new profiles after 50 s. For each: `nft_tokens_for_owner` (pages of 50, at
@@ -190,7 +192,7 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 
 | Secret | Used by | Notes |
 | --- | --- | --- |
-| `SNACC_CRON_SECRET` | notify-scan | random string; also stored in Vault as `snacc_cron_secret` for pg_cron |
+| `SNACC_CRON_SECRET` (optional) | notify-scan | overrides the Vault secret `snacc_cron_secret`; leave unset normally |
 | `SNACC_FAUCET_ACCOUNT_ID` | starter-pack | testnet account holding the faucet funds |
 | `SNACC_FAUCET_PRIVATE_KEY` | starter-pack | `ed25519:<base58>` full-access key of that account (testnet only) |
 | `SNACC_CONTRACT_ID` (optional) | record-tx, notify-scan | default `snacc-v001.testnet` |
@@ -203,7 +205,7 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
    creates only `*_snacc` objects and `snacc_*` functions/triggers/policies; never drops anything.
 2. Apply `migrations/20261113000002_snacc_cron.sql` (a no-op that records the file).
 3. Run `tests/snacc_rls.sql` as `postgres`; expect the notice `ALL SNACC RLS CHECKS PASSED` (it rolls back).
-4. Set the secrets: `SNACC_CRON_SECRET`, and (for the starter pack) `SNACC_FAUCET_ACCOUNT_ID`,
+4. Set the secrets (for the starter pack) `SNACC_FAUCET_ACCOUNT_ID`,
    `SNACC_FAUCET_PRIVATE_KEY`.
 5. Deploy each function together with `_shared/` and `_deno/`:
    `near-auth` and `notify-scan` with verify_jwt **false**, `record-tx` and `starter-pack` with verify_jwt
@@ -211,8 +213,9 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
    `config.toml`).
 6. Smoke test: `POST /near-auth/challenge` with `{"accountId":"<you>.testnet"}` returns a nonce; a wrong-origin
    request gets no `Access-Control-Allow-Origin`; `POST /notify-scan` without the header returns 401.
-7. Enable the schedule: follow the commented steps in `migrations/20261113000002_snacc_cron.sql`
-   (extensions, Vault secret, `cron.schedule('snacc_notify_scan', '*/10 * * * *', ...)`).
+7. Enable the schedule: apply `migrations/20261113000005_snacc_cron_vault.sql` (pg_cron + pg_net, a
+   database-generated Vault secret, `snacc_cron_secret_ok()`, and `cron.schedule('snacc_notify_scan',
+   '*/10 * * * *', ...)`). The commented steps in `20261113000002_snacc_cron.sql` are superseded.
 
 ## Tests
 

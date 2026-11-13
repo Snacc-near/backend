@@ -1,4 +1,4 @@
-// notify-scan (deploy with verify_jwt = false; requires header x-cron-secret = SNACC_CRON_SECRET)
+// notify-scan (deploy with verify_jwt = false; requires header x-cron-secret = Vault secret snacc_cron_secret)
 // Scans up to SNACC_SCAN_MAX_PROFILES profiles (default 50, least recently scanned first) and inserts
 // starving / distressed / lost notifications into notifications_snacc (deduplicated per kind/strain/UTC day).
 import { fail, ok, safeEqual, toResponse } from "../_shared/http.ts";
@@ -103,11 +103,29 @@ async function scan(): Promise<Record<string, number>> {
   return counts;
 }
 
-Deno.serve(async (req: Request) => {
+/**
+ * OPS-128: the cron secret lives in Supabase Vault (migration 20261113000005). An explicit
+ * SNACC_CRON_SECRET edge secret still wins when set, so older setups keep working.
+ */
+async function cronSecretCheck(got: string): Promise<"ok" | "bad" | "unavailable"> {
+  if (!got) return "bad";
   const secret = env("SNACC_CRON_SECRET");
-  if (!secret) return toResponse(fail(503, "not_configured", "SNACC_CRON_SECRET is not set."), null, false);
+  if (secret) return safeEqual(got, secret) ? "ok" : "bad";
+  const { data, error } = await sb.rpc("snacc_cron_secret_ok", { candidate: got });
+  if (error) {
+    console.error("notify-scan: snacc_cron_secret_ok failed", error.message);
+    return "unavailable";
+  }
+  return data === true ? "ok" : "bad";
+}
+
+Deno.serve(async (req: Request) => {
   if (req.method !== "POST") return toResponse(fail(405, "method_not_allowed", "Use POST."), null, false);
-  if (!safeEqual(req.headers.get("x-cron-secret") ?? "", secret)) {
+  const check = await cronSecretCheck(req.headers.get("x-cron-secret") ?? "");
+  if (check === "unavailable") {
+    return toResponse(fail(503, "not_configured", "Cron secret check is unavailable (Vault function missing)."), null, false);
+  }
+  if (check === "bad") {
     return toResponse(fail(401, "unauthorized", "Missing or wrong x-cron-secret."), null, false);
   }
   return guarded("notify-scan", null, async () => ok(await scan()), false);
