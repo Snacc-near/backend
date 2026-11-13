@@ -13,7 +13,7 @@ import {
   readStrainOrNull,
   type StrainSnapshot,
 } from "../supabase/functions/_shared/scan.js";
-import { handleStarterPack, type StarterStore } from "../supabase/functions/_shared/starter.js";
+import { clientIp, handleStarterPack, hashClientIp, verifyTurnstile, type StarterStore } from "../supabase/functions/_shared/starter.js";
 import {
   FaucetOutcomeUnknownError,
   STARTER_AMOUNT_YOCTO,
@@ -131,9 +131,10 @@ test("readOwnedStrains: pages nft_tokens_for_owner then get_strain; readStrainOr
 });
 
 // ---- starter-pack ----
-function memStarter(accounts: Record<string, string>, preClaims = 0) {
-  const claims = new Map<string, { tx_hash: string | null; created_at: string }>();
-  for (let i = 0; i < preClaims; i++) claims.set(`filler${i}.testnet`, { tx_hash: "x", created_at: new Date(T0).toISOString() });
+function memStarter(accounts: Record<string, string>, preClaims = 0, preIp: { hash: string; n: number } | null = null) {
+  const claims = new Map<string, { tx_hash: string | null; created_at: string; ip_hash: string | null }>();
+  for (let i = 0; i < preClaims; i++) claims.set(`filler${i}.testnet`, { tx_hash: "x", created_at: new Date(T0).toISOString(), ip_hash: null });
+  for (let i = 0; i < (preIp?.n ?? 0); i++) claims.set(`ipfiller${i}.testnet`, { tx_hash: "x", created_at: new Date(T0).toISOString(), ip_hash: preIp!.hash });
   const notes: PlannedNotification[] = [];
   const store: StarterStore = {
     async nearAccountIdOf(u) {
@@ -144,11 +145,14 @@ function memStarter(accounts: Record<string, string>, preClaims = 0) {
     },
     async reserveClaim(row) {
       if (claims.has(row.near_account_id)) return false;
-      claims.set(row.near_account_id, { tx_hash: null, created_at: new Date(T0).toISOString() });
+      claims.set(row.near_account_id, { tx_hash: null, created_at: new Date(T0).toISOString(), ip_hash: row.ip_hash });
       return true;
     },
     async claimsSince(iso) {
       return [...claims.values()].filter((c) => c.created_at >= iso).length;
+    },
+    async claimsFromIpSince(hash, iso) {
+      return [...claims.values()].filter((c) => c.ip_hash === hash && c.created_at >= iso).length;
     },
     async releaseClaim(a) {
       claims.delete(a);
@@ -223,6 +227,60 @@ test("starter-pack: balance >= 0.3 NEAR, daily cap, failed transfer releases, un
 
   const noProfile = memStarter({});
   assert.equal(err(await handleStarterPack(UID, { store: noProfile.store, sendTransfer: send, viewAccount: async () => null })), "no_profile");
+});
+
+test("starter-pack SEC-119: per-IP daily cap, captcha gate, hashed IP only", async () => {
+  const send = async () => "tx";
+  const zero = async () => ({ amount: "0" });
+  const ipHash = await hashClientIp("203.0.113.7", "k");
+  assert.match(ipHash, /^[0-9a-f]{64}$/);
+  assert.notEqual(ipHash, await hashClientIp("203.0.113.8", "k"));
+  assert.notEqual(ipHash, await hashClientIp("203.0.113.7", "other-key"));
+  assert.equal(ipHash.includes("203"), false);
+
+  // 2 earlier claims from the same network: the 3rd is allowed and stores only the hash.
+  const third = memStarter({ [UID]: ACC }, 0, { hash: ipHash, n: 2 });
+  assert.equal((await handleStarterPack(UID, { store: third.store, sendTransfer: send, now: () => T0, viewAccount: zero, ipHash })).status, 200);
+  assert.equal(third.claims.get(ACC)?.ip_hash, ipHash);
+  // 3 earlier claims: the 4th is refused and its reservation released.
+  const fourth = memStarter({ [UID]: ACC }, 0, { hash: ipHash, n: 3 });
+  const r = await handleStarterPack(UID, { store: fourth.store, sendTransfer: send, now: () => T0, viewAccount: zero, ipHash });
+  assert.equal(r.status, 429);
+  assert.equal(err(r), "ip_cap_reached");
+  assert.equal(fourth.claims.has(ACC), false);
+  // Another network is not affected.
+  const other = memStarter({ [UID]: ACC }, 0, { hash: ipHash, n: 3 });
+  assert.equal((await handleStarterPack(UID, { store: other.store, sendTransfer: send, now: () => T0, viewAccount: zero, ipHash: await hashClientIp("198.51.100.1", "k") })).status, 200);
+
+  // Captcha: failing check stops before any claim; passing check proceeds.
+  const cap = memStarter({ [UID]: ACC });
+  const denied = await handleStarterPack(UID, { store: cap.store, sendTransfer: send, now: () => T0, viewAccount: zero, ipHash, verifyCaptcha: async () => false });
+  assert.equal(denied.status, 403);
+  assert.equal(err(denied), "captcha_failed");
+  assert.equal(cap.claims.size, 0);
+  assert.equal((await handleStarterPack(UID, { store: cap.store, sendTransfer: send, now: () => T0, viewAccount: zero, ipHash, verifyCaptcha: async () => true })).status, 200);
+});
+
+test("starter-pack SEC-119: clientIp header order and Turnstile verify", async () => {
+  const h = (o: Record<string, string>) => ({ get: (k: string) => o[k.toLowerCase()] ?? null });
+  assert.equal(clientIp(h({ "x-forwarded-for": " 203.0.113.7 , 10.0.0.1" })), "203.0.113.7");
+  assert.equal(clientIp(h({ "cf-connecting-ip": "198.51.100.2" })), "198.51.100.2");
+  assert.equal(clientIp(h({})), "unknown");
+
+  const calls: Array<{ url: string; body: string }> = [];
+  const fake = (answer: unknown, status = 200) =>
+    (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: String(init?.body) });
+      return new Response(JSON.stringify(answer), { status });
+    }) as typeof fetch;
+  assert.equal(await verifyTurnstile("s", "tok", "203.0.113.7", fake({ success: true })), true);
+  assert.equal(calls[0]?.url, "https://challenges.cloudflare.com/turnstile/v0/siteverify");
+  assert.match(calls[0]?.body ?? "", /secret=s&response=tok&remoteip=203\.0\.113\.7/);
+  assert.equal(await verifyTurnstile("s", "tok", "unknown", fake({ success: false })), false);
+  assert.equal(await verifyTurnstile("s", "tok", "unknown", fake({ success: true }, 500)), false);
+  assert.equal(await verifyTurnstile("s", null, "unknown", fake({ success: true })), false);
+  const boom = (async () => Promise.reject(new Error("offline"))) as typeof fetch;
+  assert.equal(await verifyTurnstile("s", "tok", "unknown", boom), false);
 });
 
 // ---- minimal Transfer signer vs near-api-js 7.4.0 ----
