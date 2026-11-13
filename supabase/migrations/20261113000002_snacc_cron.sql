@@ -1,0 +1,35 @@
+-- Snacc notify-scan schedule (every 10 minutes) with pg_cron + pg_net.
+-- Intentionally inert: applying this file changes nothing. Enable it AFTER `notify-scan` is deployed
+-- and SNACC_CRON_SECRET is set as an Edge Function secret, by running the statements below by hand
+-- (SQL editor / MCP execute_sql). The cron secret is read from Supabase Vault, never written in SQL.
+--
+-- 1) Extensions (skip if already enabled in this shared project):
+--      create extension if not exists pg_cron;
+--      create extension if not exists pg_net;
+--
+-- 2) Store the same value as the SNACC_CRON_SECRET edge secret in Vault (once):
+--      select vault.create_secret('<same value as SNACC_CRON_SECRET>', 'snacc_cron_secret', 'x-cron-secret for notify-scan');
+--
+-- 3) Schedule (cron.schedule with an existing job name updates that job, so this is re-runnable):
+--      select cron.schedule(
+--        'snacc_notify_scan',
+--        '*/10 * * * *',
+--        $job$
+--          select net.http_post(
+--            url := 'https://vldhsabgpfxccsljdtye.supabase.co/functions/v1/notify-scan',
+--            headers := jsonb_build_object(
+--              'content-type', 'application/json',
+--              'x-cron-secret', (select decrypted_secret from vault.decrypted_secrets where name = 'snacc_cron_secret' limit 1)
+--            ),
+--            body := '{}'::jsonb,
+--            timeout_milliseconds := 60000
+--          );
+--        $job$
+--      );
+--
+-- 4) Check / pause:
+--      select jobid, jobname, schedule, active from cron.job where jobname = 'snacc_notify_scan';
+--      select * from cron.job_run_details where jobid = (select jobid from cron.job where jobname = 'snacc_notify_scan') order by start_time desc limit 5;
+--      select cron.unschedule('snacc_notify_scan');   -- removes only this job
+
+select 1; -- no-op so the migration runner records this file

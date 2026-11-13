@@ -1,0 +1,15 @@
+# Minimal Supabase CLI config for the Snacc Edge Functions (remote project ref: vldhsabgpfxccsljdtye).
+# Only the per-function JWT settings matter here; everything else uses CLI defaults.
+project_id = "snacc"
+
+[functions.near-auth]
+verify_jwt = false
+
+[functions.record-tx]
+verify_jwt = true
+
+[functions.notify-scan]
+verify_jwt = false
+
+[functions.starter-pack]
+verify_jwt = true
