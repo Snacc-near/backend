@@ -13,3 +13,6 @@ verify_jwt = false
 
 [functions.starter-pack]
 verify_jwt = true
+
+[functions.track]
+verify_jwt = false
