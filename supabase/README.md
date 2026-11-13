@@ -54,7 +54,7 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `achievements_snacc` | pk (`user_id`, `code`), `earned_at` | select | select | only trigger `snacc_award_achievements()` (security definer) on `activity_snacc` insert |
 | `streaks_snacc` (view, `security_invoker`) | `user_id`, `near_account_id`, `current_streak_days`, `last_feed_day` | select | select | – |
 | `follows_snacc` | pk (`follower`, `followee`) → profiles_snacc, no self-follow | select | select; insert/delete as `follower = auth.uid()` | user |
-| `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `created_at` | – | – | service (starter-pack) |
+| `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
 | `scan_queue_snacc` (view, `security_invoker`) | profiles left-joined with scan state | – | – | read by notify-scan |
 
@@ -64,6 +64,14 @@ Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned b
 `gifter` (≥ 1 `nft_transfer`), `colony_5` (≥ 5 `incubate_strain` + `divide_strain`).
 `streaks_snacc.current_streak_days` is the run ending on the last feed day, counted only if that day is
 today or yesterday (UTC), else 0.
+
+Player RPCs (`authenticated` only, pinned to `auth.uid()`):
+
+- `snacc_delete_my_account()`: deletes the caller's auth user (cascades to their `*_snacc` rows); only for users
+  with a Snacc profile.
+- `snacc_export_my_data()` (UI-163): one JSON document `snacc-export-v1` with the caller's profile, activity,
+  achievements, notifications, notification prefs, the players they follow (public account id + username), a
+  follower count, and their starter claim (without `ip_hash`).
 
 ## HTTP contracts
 
@@ -174,9 +182,12 @@ notifies at most once per strain per UTC day. `scan_state_snacc` keeps strain id
 
 Sends 0.3 testnet NEAR from `SNACC_FAUCET_ACCOUNT_ID` once per `near_account_id`, only when the account
 holds < 0.3 NEAR (`view_account`; a not-yet-existing implicit account counts as 0), at most 100 claims per
-UTC day overall. Writes `starter_claims_snacc` (a reservation row first, so two parallel requests cannot both
-pay) and a `starter` notification. Errors: 503 `not_configured` (faucet secrets missing), 401 `unauthorized`,
-403 `no_profile`, 409 `already_claimed` (with `txHash`), 409 `balance_sufficient`, 429 `daily_cap_reached`,
+UTC day overall and at most 3 per client network per UTC day (SEC-119: an HMAC-SHA256 of the client IP is
+stored in `ip_hash`, never the raw IP). When `SNACC_TURNSTILE_SECRET` is set, the body must carry
+`{"turnstileToken": "<Cloudflare Turnstile token>"}`. Writes `starter_claims_snacc` (a reservation row first, so
+two parallel requests cannot both pay) and a `starter` notification. Errors: 503 `not_configured` (faucet
+secrets missing), 401 `unauthorized`, 403 `captcha_failed`, 403 `no_profile`, 409 `already_claimed` (with
+`txHash`), 409 `balance_sufficient`, 429 `daily_cap_reached`, 429 `ip_cap_reached`,
 502 `transfer_failed` (claim released, retry allowed), 502 `transfer_unknown` (tx submitted but no
 confirmation; claim kept with its `txHash` so a retry cannot pay twice), 503 `rpc_unavailable`.
 
@@ -195,6 +206,8 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 | `SNACC_CRON_SECRET` (optional) | notify-scan | overrides the Vault secret `snacc_cron_secret`; leave unset normally |
 | `SNACC_FAUCET_ACCOUNT_ID` | starter-pack | testnet account holding the faucet funds |
 | `SNACC_FAUCET_PRIVATE_KEY` | starter-pack | `ed25519:<base58>` full-access key of that account (testnet only) |
+| `SNACC_IP_HASH_KEY` (optional) | starter-pack | HMAC key for `ip_hash`; default: the injected service role key |
+| `SNACC_TURNSTILE_SECRET` (optional) | starter-pack | Cloudflare Turnstile secret; when set, a valid token is required |
 | `SNACC_CONTRACT_ID` (optional) | record-tx, notify-scan | default `snacc-v001.testnet` |
 | `SNACC_AUTH_EMAIL_DOMAIN` (optional) | near-auth | default `snacc-nu.vercel.app` |
 | `SNACC_SCAN_MAX_PROFILES` (optional) | notify-scan | default 50 |
@@ -216,6 +229,8 @@ Injected by Supabase: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (all functions
 7. Enable the schedule: apply `migrations/20261113000005_snacc_cron_vault.sql` (pg_cron + pg_net, a
    database-generated Vault secret, `snacc_cron_secret_ok()`, and `cron.schedule('snacc_notify_scan',
    '*/10 * * * *', ...)`). The commented steps in `20261113000002_snacc_cron.sql` are superseded.
+8. Apply the later migrations in file order (`…0003` delete account, `…0009` data export, `…0010` starter-pack
+   `ip_hash`, and any newer file); each is idempotent and only touches `*_snacc` / `snacc_*` objects.
 
 ## Tests
 
