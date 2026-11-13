@@ -2,6 +2,13 @@
 
 M5 indexer-api: `NEP-297` event scanner + `/api/crucible/*` endpoints. Backlog: `INT-101..108`, `VC-020..023`.
 
+This repo has two separate parts:
+
+| Part | Where | Status |
+| --- | --- | --- |
+| Read-only indexer API (`node:http`, no runtime dependencies) | `src/`, documented in the rest of this README | Per-endpoint status in the table below; it never signs a transaction, and the public deployment runs without a `NEAR_AI_API_KEY` |
+| Player-profile backend on Supabase: migrations (every table ends in `_snacc`, row-level security on all of them) and the Edge Functions `near-auth` (NEP-413 sign-in), `record-tx`, `notify-scan` and `starter-pack` | `supabase/`, see [`supabase/README.md`](supabase/README.md) for the schema, the HTTP contracts, the secrets and the deploy order | **Not deployed yet (database setup pending).** The code and unit tests are merged, but the four Edge Function URLs answered 404 when checked on 2026-11-13, so nothing in the frontend that depends on them (profiles, notifications, achievements, streaks, starter pack) is live. `npm test` covers the shared TypeScript only, not the SQL or the `Deno.serve` entry points |
+
 ## Status (scaffold `INT-101..108`)
 
 Pure Node.js + TypeScript (`node:http`, 0 runtime dependencies). The contract is configured via env — testnet by default:
