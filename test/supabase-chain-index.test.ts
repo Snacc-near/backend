@@ -109,7 +109,7 @@ test("isWellFormed guards every field the SQL views cast", () => {
 // Receipts -> rows, on real transactions
 // ---------------------------------------------------------------------------------------------
 
-test("extractEvents: every real fixture yields exactly the events the contract emitted, in log order", () => {
+test("extractEvents: every real fixture gives exactly the events the contract emitted, in log order", () => {
   const expected: Record<string, string[]> = {
     divide: ["snacc/atp_spent", "snacc/strain_divided"],
     divide_today: ["snacc/atp_spent", "snacc/strain_divided"],
