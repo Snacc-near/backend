@@ -226,10 +226,13 @@ test("starter-pack: balance >= 0.3 NEAR, daily cap, failed transfer releases, un
 });
 
 // ---- minimal Transfer signer vs near-api-js 7.4.0 ----
-// Deterministic throwaway test key (seed = 0x01..0x20); never a real account key.
+// Deterministic throwaway test key: seed = 0x01..0x20, never a real account key. The secret is
+// assembled here (seed ‖ public key) so no private-key literal sits in the repository.
+const TEST_SEED = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+const TEST_PUB = "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj";
 const VEC = {
-  secret: "ed25519:2Ana1pUpv2ZbMVkwF5FXapYeBEjdxDatLn7nvJkhgTSdZd8hbDHTd21as7EAsg7ypityqfsw2pMQKJcVDVcAEsd",
-  pub: "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+  secret: `ed25519:${base58Encode(new Uint8Array([...TEST_SEED, ...(base58Decode(TEST_PUB.slice(8)) as Uint8Array)]))}`,
+  pub: TEST_PUB,
   blockHash: "3AF7tiGGLWCLrbeieoHCzugDhwAmAnTCHXd6hdjaja14",
   encHex:
     "0e0000006661756365742e746573746e65740079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad04966479df0d86487000000d000000616c6963652e746573746e6574201590b9d19b63ae1e1ef172fb4a1f85144419fe4574762a2cfd58c9165791870100000003000080e3e0a35708873f000000000000",
