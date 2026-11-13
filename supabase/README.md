@@ -70,6 +70,10 @@ RLS is enabled on every table. "Service only" = RLS on, no policies, all privile
 | `starter_claims_snacc` | `near_account_id` pk, `user_id`, `amount_yocto`, `tx_hash`, `ip_hash` (HMAC, SEC-119), `created_at` | – | – | service (starter-pack) |
 | `scan_state_snacc` | `user_id` pk, `near_account_id`, `strains` jsonb (strain id → last status), `scanned_at` | – | – | service (notify-scan) |
 | `scan_queue_snacc` (view, `security_invoker`) | profiles left-joined with scan state | – | – | read by notify-scan |
+| `admins_snacc` | `user_id` pk → profiles_snacc, `added_at` | – | – | service / SQL editor |
+| `blocked_terms_snacc` | `term` pk (`^[a-z]{3,30}$`), `kind` reserved/abusive | – | – | admins via `snacc_admin_block_term()` |
+| `announcements_snacc` | `id`, `title`, `body`, `created_by`, `created_at`, `expires_at` | select (unexpired) | select (unexpired) | admins via `snacc_admin_broadcast()` |
+| `client_telemetry_snacc` | `kind` event/error, `name`, `device_id`, `session_id`, `route`, `props`, `message`, `stack`, `ip_hash`, `client_at` | – | – | service (track); admins read aggregates via `snacc_admin_metrics()` |
 
 Achievement codes (rules duplicated in `functions/_shared/rules.ts` and pinned by unit tests):
 `first_hatch` (≥ 1 `incubate_strain`), `first_feed` (≥ 1 `feed_strain`), `feeds_10` (≥ 10 `feed_strain`),
@@ -125,6 +129,19 @@ Player RPCs (`authenticated` only, pinned to `auth.uid()`):
   status text instead of raising: `claimed`, `no_profile`, `already_referred`, `invalid_account`,
   `unknown_referrer`, `self_referral` or `not_new_player` (the caller already has a recorded `incubate_strain`).
   Not signed in raises `28000`. The `recruiter` badge is cosmetic: no XP, no token, no money value (testnet).
+
+Moderation and admin (UI-162, migration `0011`):
+
+- A `before insert or update of username, bio` trigger on `profiles_snacc` refuses a username that equals a
+  reserved word (`admin`, `snacc`, `near`, ... also with trailing digits or digit swaps such as `sn4cc`) and any
+  username or bio that contains a blocked word: error `username_not_allowed` / `bio_not_allowed` (`P0001`, the
+  category is in `detail`). The seed list is short on purpose; admins extend it with `snacc_admin_block_term()`.
+- `snacc_text_violation(text, is_username)` lets the client check a name before saving (`authenticated`).
+- `admins_snacc` (service only) lists admin user ids; `snacc_is_admin()` tells the caller whether they are one.
+- `snacc_admin_broadcast(title, body, days)` writes `announcements_snacc` (public, read-only, expires after
+  `days`) and a `system` notification for every profile with system notifications on.
+- `snacc_admin_reset_profile_text(account)` clears a player's username and bio and notifies them.
+- Every admin RPC raises `admin_only` (`42501`) for non-admins. Test: `tests/snacc_moderation.sql`.
 
 ## HTTP contracts
 
@@ -249,6 +266,18 @@ instead of `npm:near-api-js`. The faucet needs exactly one transaction shape, ne
 dependency tree into every cold start, and the hand-written layout is pinned byte-for-byte to a
 near-api-js 7.4.0 vector in `test/supabase-rules.test.ts`. The key is parsed once, imported as a
 non-extractable `CryptoKey`, and never logged; error messages never include key material.
+
+### `track` (verify_jwt **false**, OPS-127)
+
+`POST /track` from an allowed origin (`ALLOWED_ORIGINS` in `_shared/http.ts`; anything else 403
+`origin_not_allowed`) with `{"deviceId", "sessionId", "events": [{name, route, props, ts}], "errors": [{name,
+message, stack, route, ts}]}` → 202 `{"stored", "rejected"}`. Limits: 16 KB body (413), 20 items, 300 rows per
+hashed client IP per hour (429 `rate_limited`). Event names are allow-listed (`TELEMETRY_EVENTS` in
+`_shared/telemetry.ts`). Stored in `client_telemetry_snacc` (service only): random browser device/session ids,
+a generalised route (`/snacc/:id`, `/p/:account`), allow-listed props, error text scrubbed of keys, JWTs,
+emails, URL queries, NEAR account ids and hashes; no account id, no raw IP. Admins read
+`snacc_admin_metrics(days)`: daily funnel (landing → app → onboarding → wallet → sign-in → first successful tx,
+distinct devices), D1/D7 retention by first-seen day, and the top client errors of the last 7 days.
 
 ## Environment and secrets
 
