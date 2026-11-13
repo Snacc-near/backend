@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
-import { bestFeedStreak, computeAchievements, currentFeedStreak, utcDay } from "../supabase/functions/_shared/rules.js";
+import { ACHIEVEMENT_CODES, bestFeedStreak, computeAchievements, currentFeedStreak, utcDay } from "../supabase/functions/_shared/rules.js";
 import {
   DEFAULT_PREFS,
   dedupeKey,
@@ -58,6 +58,19 @@ test("achievements: every code and its threshold", () => {
   assert.deepEqual([...computeAchievements(colony)].sort(), ["colony_5", "first_hatch"]);
   assert.equal(computeAchievements(colony.slice(0, 4)).has("colony_5"), false);
   assert.deepEqual([...computeAchievements([act("splice_strains", T0)])], []);
+});
+
+test("achievements: recruiter is a listed code but never derived from the player's own activity (UI-158)", () => {
+  assert.ok((ACHIEVEMENT_CODES as readonly string[]).includes("recruiter"));
+  // The original eight codes stay in place; recruiter is appended.
+  assert.deepEqual(
+    [...ACHIEVEMENT_CODES],
+    ["first_hatch", "first_feed", "feeds_10", "streak_3", "streak_7", "rescuer", "gifter", "colony_5", "recruiter"],
+  );
+  // Whatever a player does themselves, the badge depends on someone else's first hatch (referrals_snacc), so it is
+  // only ever awarded by the SQL trigger and never by computeAchievements.
+  const everything = ["incubate_strain", "feed_strain", "adopt", "nft_transfer", "divide_strain"].map((m) => act(m, T0));
+  assert.equal(computeAchievements(everything).has("recruiter" as never), false);
 });
 
 // ---- notify-scan ----
